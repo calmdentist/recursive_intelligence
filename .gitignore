@@ -1,0 +1,9 @@
+.ri/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.context/
