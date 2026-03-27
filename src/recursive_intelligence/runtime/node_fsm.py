@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from recursive_intelligence.runtime.state_store import NodeRecord, NodeState, StateStore
@@ -13,10 +13,12 @@ from recursive_intelligence.runtime.state_store import NodeRecord, NodeState, St
 class PlanDecision:
     """Typed decision returned by a node's planning phase."""
 
-    action: str  # solve_directly, spawn_children, review_children, integrate_and_finish
+    action: str  # solve_directly, spawn_children, route_to_children, pause, done
     rationale: str = ""
     children: list[ChildSpec] | None = None
     file_scope: list[str] | None = None
+    # For route_to_children: which existing children to reactivate
+    routes: list[RouteSpec] | None = None
 
 
 @dataclass
@@ -25,7 +27,19 @@ class ChildSpec:
 
     idempotency_key: str
     objective: str
-    success_criteria: list[str]
+    success_criteria: list[str] = field(default_factory=list)
+    domain_name: str | None = None
+    file_patterns: list[str] | None = None
+    module_scope: str | None = None
+
+
+@dataclass
+class RouteSpec:
+    """Route follow-up work to an existing child."""
+
+    child_node_id: str
+    domain_name: str
+    task_spec: str
 
 
 @dataclass
@@ -89,7 +103,7 @@ class NodeFSM:
         if decision.action == "solve_directly":
             return self.store.transition_node(self.node_id, NodeState.EXECUTING, data)
 
-        elif decision.action == "spawn_children":
+        elif decision.action in ("spawn_children", "route_to_children"):
             node = self.store.transition_node(self.node_id, NodeState.WAITING_ON_CHILDREN, data)
             if decision.children:
                 for child_spec in decision.children:
@@ -101,6 +115,12 @@ class NodeFSM:
 
         elif decision.action == "integrate_and_finish":
             return self.store.transition_node(self.node_id, NodeState.MERGING, data)
+
+        elif decision.action == "pause":
+            return self.store.transition_node(self.node_id, NodeState.PAUSED, data)
+
+        elif decision.action == "done":
+            return self.store.transition_node(self.node_id, NodeState.COMPLETED, data)
 
         else:
             raise ValueError(f"Unknown plan action: {decision.action}")
@@ -134,16 +154,13 @@ class NodeFSM:
 
         self.store.append_event(self.node.run_id, self.node_id, "review_verdict", data)
 
-        # If this child needs revision, go back to waiting immediately
         if verdict.verdict == "revise":
             return self.store.transition_node(self.node_id, NodeState.WAITING_ON_CHILDREN, data)
 
         # Only consider verdicts from the CURRENT review round.
-        # A new round starts each time the parent enters REVIEWING_CHILDREN.
         children = self.store.get_children(self.node_id)
         events = self.store.get_node_events(self.node_id)
 
-        # Find the start of the current review round
         current_round_start = 0
         for i, e in enumerate(events):
             if (e.event_type == "state_transition"
@@ -170,12 +187,25 @@ class NodeFSM:
                 "failure_reason": "No child produced acceptable work",
             })
 
-        # Still waiting on more children to review in this round
         return self.node
 
     def finish_merge(self, commit_sha: str) -> NodeRecord:
         data = {"final_commit_sha": commit_sha}
         return self.store.transition_node(self.node_id, NodeState.COMPLETED, data)
+
+    def pause_after_merge(self, commit_sha: str) -> NodeRecord:
+        """Pause after merge instead of completing — for persistent multi-pass runs."""
+        data = {"merge_commit_sha": commit_sha}
+        return self.store.transition_node(self.node_id, NodeState.PAUSED, data)
+
+    def resume_from_pause(self, user_input: str) -> NodeRecord:
+        """Resume a paused node for a new pass."""
+        self.store.append_event(self.node.run_id, self.node_id, "user_input", {
+            "input": user_input,
+        })
+        return self.store.transition_node(self.node_id, NodeState.PLANNING, {
+            "reason": "user_follow_up",
+        })
 
     def fail(self, reason: str, failure_type: str = "error") -> NodeRecord:
         return self.store.transition_node(self.node_id, NodeState.FAILED, {
@@ -189,7 +219,6 @@ class NodeFSM:
         })
 
     def wake_for_review(self) -> NodeRecord:
-        """Wake a waiting parent to review children."""
         return self.store.transition_node(self.node_id, NodeState.REVIEWING_CHILDREN)
 
     def _spawn_child(self, spec: ChildSpec) -> NodeRecord | None:
@@ -212,5 +241,16 @@ class NodeFSM:
             "objective": spec.objective,
             "success_criteria": spec.success_criteria,
         })
+
+        # Register domain if provided
+        if spec.domain_name:
+            self.store.register_domain(
+                run_id=node.run_id,
+                parent_node_id=self.node_id,
+                child_node_id=child.node_id,
+                domain_name=spec.domain_name,
+                file_patterns=spec.file_patterns,
+                module_scope=spec.module_scope or "",
+            )
 
         return child

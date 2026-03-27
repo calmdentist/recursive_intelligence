@@ -321,8 +321,7 @@ class TestReviseLoop:
             # Child B re-executes (second attempt)
             {"status": "implemented", "summary": "B v2 with tests",
              "_commit": True, "_commit_file": "b_v2.txt", "_commit_msg": "B v2"},
-            # Round 2 review: both must be re-reviewed
-            {"verdict": "accept", "reason": "A still good"},
+            # Round 2 review: only B needs re-review (A was auto-accepted, no new work)
             {"verdict": "accept", "reason": "B now has tests"},
         ])
 
@@ -347,12 +346,10 @@ class TestReviseLoop:
         assert (root_wt / "b_v1.txt").exists()
         assert (root_wt / "b_v2.txt").exists()
 
-        # Verify adapter call sequence:
-        # plan, planA, execA, planB, execB, reviewA, reviewB,
-        # execB(revision), reviewA(round2), reviewB(round2)
+        # Round 1: 2 reviews (A accepted, B revised)
+        # Round 2: 1 review (B only — A auto-accepted since it has no new work)
         modes = [c["mode"] for c in adapter.calls]
-        assert modes.count("review") == 4  # 2 per round, 2 rounds
-        store.close()
+        assert modes.count("review") == 3
         store.close()
 
 

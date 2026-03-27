@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 SYSTEM_CONTRACT = """\
 You are a node in a recursive coding-agent runtime. You are working inside an isolated git worktree.
 
@@ -40,6 +42,7 @@ Inspect the repository and decide how to accomplish this task.
 ```
 
 ## If spawning children
+Each child should own a clear domain (a set of files/modules it is responsible for).
 ```json
 {{
   "action": "spawn_children",
@@ -48,7 +51,10 @@ Inspect the repository and decide how to accomplish this task.
     {{
       "idempotency_key": "short-unique-slug",
       "objective": "specific task description for child",
-      "success_criteria": ["criterion 1", "criterion 2"]
+      "success_criteria": ["criterion 1", "criterion 2"],
+      "domain_name": "short-domain-slug",
+      "file_patterns": ["src/module/**", "tests/test_module*"],
+      "module_scope": "Human-readable description of what this domain owns"
     }}
   ]
 }}
@@ -137,6 +143,111 @@ Your previous work needs changes.
 1. Make the requested changes in your worktree.
 2. Stage and commit all changes.
 3. Return an updated JSON result.
+
+```json
+{{"status": "implemented", "summary": "what you changed", "changed_files": ["..."], "commit_sha": "..."}}
+```
+
+Return ONLY the JSON object after committing.
+"""
+
+
+def routing_prompt(user_input: str, domains: list[dict[str, Any]], pass_number: int) -> str:
+    """Prompt for the root node on pass 2+ — route work to existing children or spawn new ones."""
+
+    if domains:
+        table_rows = []
+        for d in domains:
+            patterns = ", ".join(d.get("file_patterns", []))
+            table_rows.append(
+                f"| {d['domain_name']} | {d['child_node_id'][:12]} | {patterns} | "
+                f"{d.get('module_scope', '')} | {d.get('child_state', 'unknown')} | "
+                f"{d.get('last_summary', '')[:60]} |"
+            )
+        domain_table = (
+            "| Domain | Child ID | Files | Scope | State | Last Summary |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            + "\n".join(table_rows)
+        )
+    else:
+        domain_table = "(no children spawned yet)"
+
+    return f"""\
+## Your Department (pass {pass_number})
+
+{domain_table}
+
+## New Instructions from User
+{user_input}
+
+## Instructions
+Decide how to handle this follow-up request. You have these options:
+
+### Route to existing children
+If the work falls within existing children's domains, reactivate them:
+```json
+{{
+  "action": "route_to_children",
+  "rationale": "why these children should handle it",
+  "routes": [
+    {{"child_node_id": "node-...", "domain_name": "...", "task_spec": "specific follow-up task for this child"}}
+  ]
+}}
+```
+
+### Spawn new children
+If this is genuinely new scope that no existing child covers:
+```json
+{{
+  "action": "spawn_children",
+  "rationale": "why a new child is needed",
+  "children": [
+    {{
+      "idempotency_key": "...", "objective": "...", "success_criteria": [...],
+      "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."
+    }}
+  ]
+}}
+```
+
+### Solve directly
+If this is a small follow-up you can handle yourself:
+```json
+{{"action": "solve_directly", "rationale": "..."}}
+```
+
+### Done
+If the user is signaling completion or you have nothing more to do:
+```json
+{{"action": "done", "rationale": "..."}}
+```
+
+Return ONLY the JSON object.
+"""
+
+
+def reactivation_prompt(original_task: str, previous_summary: str, new_task: str) -> str:
+    """Prompt for a child being re-activated with follow-up work."""
+
+    return f"""\
+## Reactivation
+
+You previously worked on this domain and completed the following:
+
+### Original task
+{original_task}
+
+### What you did
+{previous_summary or "(no summary available)"}
+
+### New follow-up task
+{new_task}
+
+## Instructions
+1. Review your previous work in the worktree.
+2. Implement the follow-up changes.
+3. Stage and commit all changes.
+4. Return a JSON result.
 
 ```json
 {{"status": "implemented", "summary": "what you changed", "changed_files": ["..."], "commit_sha": "..."}}

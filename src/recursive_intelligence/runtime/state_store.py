@@ -19,6 +19,7 @@ class NodeState(str, Enum):
     WAITING_ON_CHILDREN = "waiting_on_children"
     REVIEWING_CHILDREN = "reviewing_children"
     MERGING = "merging"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -27,17 +28,24 @@ class NodeState(str, Enum):
     def is_terminal(self) -> bool:
         return self in (NodeState.COMPLETED, NodeState.FAILED, NodeState.CANCELLED)
 
+    @property
+    def is_idle(self) -> bool:
+        """Node is idle — either terminal or paused (waiting for external input)."""
+        return self.is_terminal or self == NodeState.PAUSED
+
 
 VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     NodeState.QUEUED: {NodeState.PLANNING, NodeState.CANCELLED},
     NodeState.PLANNING: {
         NodeState.EXECUTING,
         NodeState.WAITING_ON_CHILDREN,
+        NodeState.PAUSED,
         NodeState.FAILED,
         NodeState.CANCELLED,
     },
     NodeState.EXECUTING: {
         NodeState.COMPLETED,
+        NodeState.PAUSED,
         NodeState.WAITING_ON_CHILDREN,
         NodeState.FAILED,
         NodeState.CANCELLED,
@@ -55,10 +63,17 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     },
     NodeState.MERGING: {
         NodeState.COMPLETED,
+        NodeState.PAUSED,  # multi-pass: pause after merge
         NodeState.FAILED,
         NodeState.CANCELLED,
     },
-    NodeState.COMPLETED: {NodeState.EXECUTING},  # revise loop: parent requests revision
+    NodeState.PAUSED: {
+        NodeState.PLANNING,  # resume with new input
+        NodeState.EXECUTING,  # resume for follow-up work
+        NodeState.COMPLETED,  # user says "done"
+        NodeState.CANCELLED,
+    },
+    NodeState.COMPLETED: {NodeState.EXECUTING},  # revise loop
     NodeState.FAILED: set(),
     NodeState.CANCELLED: set(),
 }
@@ -97,7 +112,22 @@ class RunRecord:
     root_node_id: str | None
     created_at: str
     finished_at: str | None
-    status: str  # "running", "completed", "failed"
+    status: str  # "running", "paused", "completed", "failed"
+    pass_count: int = 1
+    persistent: bool = False
+
+
+@dataclass
+class DomainRecord:
+    domain_id: str
+    run_id: str
+    parent_node_id: str
+    child_node_id: str
+    domain_name: str
+    file_patterns: list[str]
+    module_scope: str
+    created_at: str
+    updated_at: str
 
 
 class StateStore:
@@ -120,7 +150,9 @@ class StateStore:
                 root_node_id TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
-                status TEXT NOT NULL DEFAULT 'running'
+                status TEXT NOT NULL DEFAULT 'running',
+                pass_count INTEGER NOT NULL DEFAULT 1,
+                persistent INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS nodes (
@@ -156,11 +188,26 @@ class StateStore:
                 cost_json TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS domain_registry (
+                domain_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                parent_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+                child_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+                domain_name TEXT NOT NULL,
+                file_patterns TEXT NOT NULL DEFAULT '[]',
+                module_scope TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(parent_node_id, domain_name)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_node ON events(node_id);
             CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_run ON nodes(run_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_state ON nodes(state);
+            CREATE INDEX IF NOT EXISTS idx_domain_parent ON domain_registry(parent_node_id);
+            CREATE INDEX IF NOT EXISTS idx_domain_child ON domain_registry(child_node_id);
         """)
         self._conn.commit()
 
@@ -169,22 +216,18 @@ class StateStore:
 
     # --- Runs ---
 
-    def create_run(self, repo_root: str, task: str) -> RunRecord:
+    def create_run(self, repo_root: str, task: str, persistent: bool = False) -> RunRecord:
         run_id = _new_id("run")
         now = _now()
         self._conn.execute(
-            "INSERT INTO runs (run_id, repo_root, task, created_at, status) VALUES (?, ?, ?, ?, 'running')",
-            (run_id, repo_root, task, now),
+            "INSERT INTO runs (run_id, repo_root, task, created_at, status, persistent) VALUES (?, ?, ?, ?, 'running', ?)",
+            (run_id, repo_root, task, now, 1 if persistent else 0),
         )
         self._conn.commit()
         return RunRecord(
-            run_id=run_id,
-            repo_root=repo_root,
-            task=task,
-            root_node_id=None,
-            created_at=now,
-            finished_at=None,
-            status="running",
+            run_id=run_id, repo_root=repo_root, task=task, root_node_id=None,
+            created_at=now, finished_at=None, status="running",
+            pass_count=1, persistent=persistent,
         )
 
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -201,10 +244,23 @@ class StateStore:
         )
         self._conn.commit()
 
+    def pause_run(self, run_id: str) -> None:
+        now = _now()
+        self._conn.execute(
+            "UPDATE runs SET status = 'paused' WHERE run_id = ?", (run_id,),
+        )
+        self._conn.commit()
+
+    def resume_paused_run(self, run_id: str) -> None:
+        self._conn.execute(
+            "UPDATE runs SET status = 'running', pass_count = pass_count + 1 WHERE run_id = ?",
+            (run_id,),
+        )
+        self._conn.commit()
+
     def set_root_node(self, run_id: str, node_id: str) -> None:
         self._conn.execute(
-            "UPDATE runs SET root_node_id = ? WHERE run_id = ?",
-            (node_id, run_id),
+            "UPDATE runs SET root_node_id = ? WHERE run_id = ?", (node_id, run_id),
         )
         self._conn.commit()
 
@@ -227,21 +283,13 @@ class StateStore:
             (node_id, run_id, parent_id, task_spec, worktree_path, branch_name, now, now),
         )
         self._append_event(run_id, node_id, "node_created", {
-            "parent_id": parent_id,
-            "task_spec": task_spec,
+            "parent_id": parent_id, "task_spec": task_spec,
         })
         self._conn.commit()
         return NodeRecord(
-            node_id=node_id,
-            run_id=run_id,
-            parent_id=parent_id,
-            task_spec=task_spec,
-            state=NodeState.QUEUED,
-            worktree_path=worktree_path,
-            branch_name=branch_name,
-            session_id=None,
-            created_at=now,
-            updated_at=now,
+            node_id=node_id, run_id=run_id, parent_id=parent_id, task_spec=task_spec,
+            state=NodeState.QUEUED, worktree_path=worktree_path, branch_name=branch_name,
+            session_id=None, created_at=now, updated_at=now,
         )
 
     def get_node(self, node_id: str) -> NodeRecord | None:
@@ -277,12 +325,9 @@ class StateStore:
             (new_state.value, now, node_id),
         )
         self._append_event(node.run_id, node_id, "state_transition", {
-            "from": current.value,
-            "to": new_state.value,
-            **(data or {}),
+            "from": current.value, "to": new_state.value, **(data or {}),
         })
         self._conn.commit()
-
         node.state = new_state
         node.updated_at = now
         return node
@@ -297,8 +342,7 @@ class StateStore:
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [_now(), node_id]
         self._conn.execute(
-            f"UPDATE nodes SET {set_clause}, updated_at = ? WHERE node_id = ?",
-            values,
+            f"UPDATE nodes SET {set_clause}, updated_at = ? WHERE node_id = ?", values,
         )
         self._conn.commit()
 
@@ -354,10 +398,64 @@ class StateStore:
         )
         self._conn.commit()
 
+    # --- Domain Registry ---
+
+    def register_domain(
+        self,
+        run_id: str,
+        parent_node_id: str,
+        child_node_id: str,
+        domain_name: str,
+        file_patterns: list[str] | None = None,
+        module_scope: str = "",
+    ) -> DomainRecord:
+        domain_id = _new_id("dom")
+        now = _now()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO domain_registry
+               (domain_id, run_id, parent_node_id, child_node_id, domain_name, file_patterns, module_scope, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (domain_id, run_id, parent_node_id, child_node_id, domain_name,
+             json.dumps(file_patterns or []), module_scope, now, now),
+        )
+        self._conn.commit()
+        return DomainRecord(
+            domain_id=domain_id, run_id=run_id, parent_node_id=parent_node_id,
+            child_node_id=child_node_id, domain_name=domain_name,
+            file_patterns=file_patterns or [], module_scope=module_scope,
+            created_at=now, updated_at=now,
+        )
+
+    def get_domains(self, parent_node_id: str) -> list[DomainRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM domain_registry WHERE parent_node_id = ? ORDER BY created_at",
+            (parent_node_id,),
+        ).fetchall()
+        return [_row_to_domain(r) for r in rows]
+
+    def get_domain_by_child(self, child_node_id: str) -> DomainRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM domain_registry WHERE child_node_id = ?", (child_node_id,),
+        ).fetchone()
+        return _row_to_domain(row) if row else None
+
+    def update_domain(self, domain_id: str, **fields: Any) -> None:
+        allowed = {"file_patterns", "module_scope", "domain_name"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        if "file_patterns" in updates:
+            updates["file_patterns"] = json.dumps(updates["file_patterns"])
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [_now(), domain_id]
+        self._conn.execute(
+            f"UPDATE domain_registry SET {set_clause}, updated_at = ? WHERE domain_id = ?", values,
+        )
+        self._conn.commit()
+
     # --- Child spawn idempotency ---
 
     def child_spawn_key_exists(self, parent_id: str, child_slot: str, task_hash: str) -> bool:
-        """Check if a child with this dedupe key already exists."""
         rows = self._conn.execute(
             """SELECT 1 FROM events
                WHERE node_id = ? AND event_type = 'child_spawned'
@@ -380,38 +478,36 @@ def _now() -> str:
 
 def _row_to_node(row: sqlite3.Row) -> NodeRecord:
     return NodeRecord(
-        node_id=row["node_id"],
-        run_id=row["run_id"],
-        parent_id=row["parent_id"],
-        task_spec=row["task_spec"],
-        state=NodeState(row["state"]),
-        worktree_path=row["worktree_path"],
-        branch_name=row["branch_name"],
-        session_id=row["session_id"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        metadata=json.loads(row["metadata"]),
+        node_id=row["node_id"], run_id=row["run_id"], parent_id=row["parent_id"],
+        task_spec=row["task_spec"], state=NodeState(row["state"]),
+        worktree_path=row["worktree_path"], branch_name=row["branch_name"],
+        session_id=row["session_id"], created_at=row["created_at"],
+        updated_at=row["updated_at"], metadata=json.loads(row["metadata"]),
     )
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
-        run_id=row["run_id"],
-        repo_root=row["repo_root"],
-        task=row["task"],
-        root_node_id=row["root_node_id"],
-        created_at=row["created_at"],
-        finished_at=row["finished_at"],
-        status=row["status"],
+        run_id=row["run_id"], repo_root=row["repo_root"], task=row["task"],
+        root_node_id=row["root_node_id"], created_at=row["created_at"],
+        finished_at=row["finished_at"], status=row["status"],
+        pass_count=row["pass_count"], persistent=bool(row["persistent"]),
     )
 
 
 def _row_to_event(row: sqlite3.Row) -> Event:
     return Event(
-        event_id=row["event_id"],
-        run_id=row["run_id"],
-        node_id=row["node_id"],
-        event_type=row["event_type"],
-        timestamp=row["timestamp"],
+        event_id=row["event_id"], run_id=row["run_id"], node_id=row["node_id"],
+        event_type=row["event_type"], timestamp=row["timestamp"],
         data=json.loads(row["data"]),
+    )
+
+
+def _row_to_domain(row: sqlite3.Row) -> DomainRecord:
+    return DomainRecord(
+        domain_id=row["domain_id"], run_id=row["run_id"],
+        parent_node_id=row["parent_node_id"], child_node_id=row["child_node_id"],
+        domain_name=row["domain_name"], file_patterns=json.loads(row["file_patterns"]),
+        module_scope=row["module_scope"], created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
