@@ -32,11 +32,6 @@ class ClaudeAdapter(AgentAdapter):
         system_prompt: str | None = None,
         resume_session_id: str | None = None,
     ) -> NodeResult:
-        """Run a Claude session to completion via the Agent SDK.
-
-        Creates a new session or resumes an existing one. Returns the
-        structured result, session ID, and cost information.
-        """
         from claude_agent_sdk import (
             ClaudeAgentOptions,
             ResultMessage,
@@ -75,9 +70,7 @@ class ClaudeAdapter(AgentAdapter):
 
         log.info(
             "Running Claude session: mode=%s, resume=%s, cwd=%s",
-            mode,
-            resume_session_id or "(new)",
-            worktree,
+            mode, resume_session_id or "(new)", worktree,
         )
 
         async for message in query(prompt=prompt, options=options):
@@ -95,23 +88,18 @@ class ClaudeAdapter(AgentAdapter):
                 duration_api_ms = message.duration_api_ms
                 log.info(
                     "Session complete: stop_reason=%s, cost=$%.4f, turns=%d, duration=%dms",
-                    stop_reason,
-                    total_cost_usd,
-                    num_turns,
-                    duration_ms,
+                    stop_reason, total_cost_usd, num_turns, duration_ms,
                 )
 
         if session_id is None:
             session_id = "unknown"
 
-        # Build cost record from SDK usage data
         cost = CostRecord(
             input_tokens=usage.get("input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
             total_usd=total_cost_usd,
         )
 
-        # Try to parse structured JSON from the result
         raw: dict[str, Any] = {}
         if result_text:
             try:
@@ -120,7 +108,6 @@ class ClaudeAdapter(AgentAdapter):
                 log.warning("Could not parse JSON from result, using raw text")
                 raw = {"_raw_text": result_text}
 
-        # Stash run metadata for callers that need it
         raw["_num_turns"] = num_turns
         raw["_duration_ms"] = duration_ms
         raw["_duration_api_ms"] = duration_api_ms
