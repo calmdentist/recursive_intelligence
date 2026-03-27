@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "recursive-intelligence"
+version = "0.1.0"
+description = "Recursive coding-agent runtime built on top of Claude Code"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "claude-agent-sdk",
+]
+
+[project.scripts]
+ri = "recursive_intelligence.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recursive_intelligence"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
