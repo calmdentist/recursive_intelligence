@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ri = "recursive_intelligence.cli:main"
+rari = "recursive_intelligence.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/recursive_intelligence"]

@@ -523,7 +523,7 @@ class Orchestrator:
                 result = await self.adapter.run(
                     prompt=prompt, worktree=parent_wt, mode="review",
                     resume_session_id=node.session_id,
-                )
+                    )
             except Exception as e:
                 log.error("Review failed for %s: %s", child.node_id, e)
                 verdict = ReviewVerdict(
