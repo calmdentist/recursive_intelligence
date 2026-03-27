@@ -134,33 +134,43 @@ class NodeFSM:
 
         self.store.append_event(self.node.run_id, self.node_id, "review_verdict", data)
 
-        # Check if all children have been reviewed
-        children = self.store.get_children(self.node_id)
-        events = self.store.get_node_events(self.node_id)
-        review_verdicts = [e for e in events if e.event_type == "review_verdict"]
-        reviewed_ids = {e.data.get("child_id") for e in review_verdicts}
-
-        # If any child needs revision, go back to waiting
+        # If this child needs revision, go back to waiting immediately
         if verdict.verdict == "revise":
             return self.store.transition_node(self.node_id, NodeState.WAITING_ON_CHILDREN, data)
 
-        # If all children reviewed and at least one accepted, proceed to merging
+        # Only consider verdicts from the CURRENT review round.
+        # A new round starts each time the parent enters REVIEWING_CHILDREN.
+        children = self.store.get_children(self.node_id)
+        events = self.store.get_node_events(self.node_id)
+
+        # Find the start of the current review round
+        current_round_start = 0
+        for i, e in enumerate(events):
+            if (e.event_type == "state_transition"
+                    and e.data.get("to") == NodeState.REVIEWING_CHILDREN.value):
+                current_round_start = i
+
+        current_round_verdicts = [
+            e for e in events[current_round_start:]
+            if e.event_type == "review_verdict"
+        ]
+        reviewed_ids = {e.data.get("child_id") for e in current_round_verdicts}
+
         all_reviewed = all(c.node_id in reviewed_ids for c in children)
         has_accepted = any(
-            e.data.get("verdict") == "accept" for e in review_verdicts
+            e.data.get("verdict") == "accept" for e in current_round_verdicts
         )
 
         if all_reviewed and has_accepted:
             return self.store.transition_node(self.node_id, NodeState.MERGING, data)
 
-        # If all reviewed but none accepted, fail
         if all_reviewed:
             return self.store.transition_node(self.node_id, NodeState.FAILED, {
                 "failure_type": "all_children_rejected",
                 "failure_reason": "No child produced acceptable work",
             })
 
-        # Still waiting on more children to review
+        # Still waiting on more children to review in this round
         return self.node
 
     def finish_merge(self, commit_sha: str) -> NodeRecord:

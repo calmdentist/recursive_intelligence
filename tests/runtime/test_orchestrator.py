@@ -294,6 +294,67 @@ class TestReviseLoop:
         assert [e.event_type for e in child_events].count("revision_requested") == 2
         store.close()
 
+    @pytest.mark.asyncio
+    async def test_multi_child_revise_one(self, config):
+        """Two children: A accepted, B revised. Stale verdicts must not cause
+        premature MERGING — B must be re-reviewed after revision."""
+        adapter = ScriptedAdapter([
+            # Root spawns 2 children
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "ca", "objective": "feature A",
+                  "success_criteria": ["A works"]},
+                 {"idempotency_key": "cb", "objective": "feature B",
+                  "success_criteria": ["B works"]},
+             ]},
+            # Child A: plan + execute
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "A done",
+             "_commit": True, "_commit_file": "a.txt", "_commit_msg": "A"},
+            # Child B: plan + execute (first attempt)
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "B v1",
+             "_commit": True, "_commit_file": "b_v1.txt", "_commit_msg": "B v1"},
+            # Round 1 review: accept A, revise B
+            {"verdict": "accept", "reason": "A looks good"},
+            {"verdict": "revise", "reason": "B needs tests", "follow_up": "add tests for B"},
+            # Child B re-executes (second attempt)
+            {"status": "implemented", "summary": "B v2 with tests",
+             "_commit": True, "_commit_file": "b_v2.txt", "_commit_msg": "B v2"},
+            # Round 2 review: both must be re-reviewed
+            {"verdict": "accept", "reason": "A still good"},
+            {"verdict": "accept", "reason": "B now has tests"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("features A and B")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        assert run.status == "completed"
+
+        root = store.get_node(run.root_node_id)
+        assert root.state == NodeState.COMPLETED
+
+        children = store.get_children(root.node_id)
+        assert len(children) == 2
+        assert all(c.state == NodeState.COMPLETED for c in children)
+
+        # Verify both children's work was merged into root worktree
+        root_wt = Path(root.worktree_path)
+        assert (root_wt / "a.txt").exists()
+        # B should have both v1 and v2 files (all commits cherry-picked)
+        assert (root_wt / "b_v1.txt").exists()
+        assert (root_wt / "b_v2.txt").exists()
+
+        # Verify adapter call sequence:
+        # plan, planA, execA, planB, execB, reviewA, reviewB,
+        # execB(revision), reviewA(round2), reviewB(round2)
+        modes = [c["mode"] for c in adapter.calls]
+        assert modes.count("review") == 4  # 2 per round, 2 rounds
+        store.close()
+        store.close()
+
 
 class TestCherryPickConflict:
     """Cherry-pick fails due to conflicting changes from two children."""
