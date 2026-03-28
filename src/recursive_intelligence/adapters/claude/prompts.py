@@ -5,62 +5,45 @@ from __future__ import annotations
 from typing import Any
 
 SYSTEM_CONTRACT = """\
-You are a node in a recursive coding-agent runtime. You are working inside an isolated git worktree.
+You are a node in a recursive coding-agent runtime. You work in an isolated git worktree.
 
-## Rules
-- Work only inside your current worktree. Never modify files outside it.
-- If the task is small enough to solve directly, solve it yourself.
-- If the task is large (many files, distinct subtasks), decompose into independent children.
-- Make child tasks narrow, specific, and independently testable.
-- Always commit your work before finishing.
-- At the end of each phase, emit ONLY a JSON object — no markdown, no explanation outside the JSON.
-
-## JSON Envelope
-Your final message in each phase MUST be a single JSON object. No wrapping text.
+- Solve small tasks directly. Decompose large tasks into children with independent file scopes.
+- Commit your work before finishing.
+- End each phase with a single JSON object. No wrapping text or markdown around it.
 """
 
 
 def planning_prompt(task_spec: str, file_scope: list[str] | None = None) -> str:
     scope = ""
     if file_scope:
-        scope = f"\nRelevant files/directories: {', '.join(file_scope)}"
+        scope = f"\nRelevant files: {', '.join(file_scope)}"
 
     return f"""\
-Inspect the repository and decide how to accomplish this task.
+Plan how to accomplish this task. Explore the repo first.
 {scope}
 ## Task
 {task_spec}
 
-## Instructions
-1. Explore the repo structure and relevant files.
-2. Decide: can you solve this directly, or should it be split into subtasks?
-3. Return your decision as a JSON object.
+## Respond with ONE of:
 
-## If solving directly
-```json
-{{"action": "solve_directly", "rationale": "why this is simple enough to do yourself"}}
-```
+Solve it yourself:
+{{"action": "solve_directly", "rationale": "..."}}
 
-## If spawning children
-Each child should own a clear domain (a set of files/modules it is responsible for).
-```json
+Split into children (give each child a distinct file scope):
 {{
   "action": "spawn_children",
-  "rationale": "why this needs decomposition",
+  "rationale": "...",
   "children": [
     {{
-      "idempotency_key": "short-unique-slug",
-      "objective": "specific task description for child",
-      "success_criteria": ["criterion 1", "criterion 2"],
-      "domain_name": "short-domain-slug",
-      "file_patterns": ["src/module/**", "tests/test_module*"],
-      "module_scope": "Human-readable description of what this domain owns"
+      "idempotency_key": "slug",
+      "objective": "what this child does",
+      "success_criteria": ["..."],
+      "domain_name": "short-name",
+      "file_patterns": ["src/module/**"],
+      "module_scope": "what this domain owns"
     }}
   ]
 }}
-```
-
-Return ONLY the JSON object. No other text.
 """
 
 
@@ -69,23 +52,13 @@ def execution_prompt(task_spec: str) -> str:
 ## Task
 {task_spec}
 
-## Instructions
-1. Implement the task in your worktree.
-2. Run any relevant tests if they exist.
-3. Stage and commit all changes with a descriptive message.
-4. Return a JSON result.
+Implement this task. Commit when done.
 
-## On success
-```json
-{{"status": "implemented", "summary": "what you did", "changed_files": ["file1.py", "file2.py"], "commit_sha": "abc123..."}}
-```
+On success:
+{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
 
-## If blocked
-```json
-{{"status": "blocked", "kind": "description of blocker", "recoverable": true, "details": "what went wrong"}}
-```
-
-Return ONLY the JSON object after committing.
+If blocked:
+{{"status": "blocked", "kind": "...", "recoverable": true, "details": "..."}}
 """
 
 
@@ -93,165 +66,104 @@ def review_prompt(child_id: str, diff: str, summary: str, success_criteria: list
     criteria_str = "\n".join(f"  - {c}" for c in success_criteria) if success_criteria else "  - (none specified)"
 
     return f"""\
-## Review child work
-
-Child ID: {child_id}
-
-### Success criteria
+Review child {child_id}'s work against these criteria:
 {criteria_str}
 
-### Child's summary
-{summary or "(no summary provided)"}
+Summary: {summary or "(none)"}
 
-### Diff
 ```diff
 {diff}
 ```
 
-## Instructions
-Review the diff against the success criteria. Return a JSON verdict:
-
-### If the work meets criteria
-```json
-{{"verdict": "accept", "child_id": "{child_id}", "reason": "why it's acceptable"}}
-```
-
-### If it needs changes
-```json
-{{"verdict": "revise", "child_id": "{child_id}", "reason": "what's wrong", "follow_up": "specific instructions for revision"}}
-```
-
-### If it's fundamentally wrong
-```json
-{{"verdict": "reject", "child_id": "{child_id}", "reason": "why it should be discarded"}}
-```
-
-Return ONLY the JSON object.
+Respond with one of:
+{{"verdict": "accept", "child_id": "{child_id}", "reason": "..."}}
+{{"verdict": "revise", "child_id": "{child_id}", "reason": "...", "follow_up": "what to fix"}}
+{{"verdict": "reject", "child_id": "{child_id}", "reason": "..."}}
 """
 
 
 def revision_prompt(follow_up: str) -> str:
     return f"""\
-## Revision requested
+Revision requested. Make these changes, commit, and return the result.
 
-Your previous work needs changes.
+Feedback: {follow_up}
 
-### Feedback
-{follow_up}
-
-## Instructions
-1. Make the requested changes in your worktree.
-2. Stage and commit all changes.
-3. Return an updated JSON result.
-
-```json
-{{"status": "implemented", "summary": "what you changed", "changed_files": ["..."], "commit_sha": "..."}}
-```
-
-Return ONLY the JSON object after committing.
+{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
 """
 
 
 def routing_prompt(user_input: str, domains: list[dict[str, Any]], pass_number: int) -> str:
-    """Prompt for the root node on pass 2+ — route work to existing children or spawn new ones."""
+    """Route follow-up work to existing children or spawn new ones."""
 
     if domains:
-        table_rows = []
+        rows = []
         for d in domains:
             patterns = ", ".join(d.get("file_patterns", []))
-            table_rows.append(
+            rows.append(
                 f"| {d['domain_name']} | {d['child_node_id'][:12]} | {patterns} | "
-                f"{d.get('module_scope', '')} | {d.get('child_state', 'unknown')} | "
-                f"{d.get('last_summary', '')[:60]} |"
+                f"{d.get('child_state', '?')} | {d.get('last_summary', '')[:50]} |"
             )
         domain_table = (
-            "| Domain | Child ID | Files | Scope | State | Last Summary |\n"
-            "| --- | --- | --- | --- | --- | --- |\n"
-            + "\n".join(table_rows)
+            "| Domain | Child | Files | State | Summary |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            + "\n".join(rows)
         )
     else:
-        domain_table = "(no children spawned yet)"
+        domain_table = "(no children yet)"
 
     return f"""\
-## Your Department (pass {pass_number})
+## Department (pass {pass_number})
 
 {domain_table}
 
-## New Instructions from User
+## User request
 {user_input}
 
-## Instructions
-Decide how to handle this follow-up request. You have these options:
+## Respond with ONE of:
 
-### Route to existing children
-If the work falls within existing children's domains, reactivate them:
-```json
-{{
-  "action": "route_to_children",
-  "rationale": "why these children should handle it",
-  "routes": [
-    {{"child_node_id": "node-...", "domain_name": "...", "task_spec": "specific follow-up task for this child"}}
-  ]
-}}
-```
+Route to existing children:
+{{"action": "route_to_children", "rationale": "...", "routes": [{{"child_node_id": "...", "domain_name": "...", "task_spec": "..."}}]}}
 
-### Spawn new children
-If this is genuinely new scope that no existing child covers:
-```json
-{{
-  "action": "spawn_children",
-  "rationale": "why a new child is needed",
-  "children": [
-    {{
-      "idempotency_key": "...", "objective": "...", "success_criteria": [...],
-      "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."
-    }}
-  ]
-}}
-```
+Spawn new children (for new scope):
+{{"action": "spawn_children", "rationale": "...", "children": [{{"idempotency_key": "...", "objective": "...", "success_criteria": [...], "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."}}]}}
 
-### Solve directly
-If this is a small follow-up you can handle yourself:
-```json
+Solve directly:
 {{"action": "solve_directly", "rationale": "..."}}
-```
 
-### Done
-If the user is signaling completion or you have nothing more to do:
-```json
+Done:
 {{"action": "done", "rationale": "..."}}
-```
-
-Return ONLY the JSON object.
 """
 
 
 def reactivation_prompt(original_task: str, previous_summary: str, new_task: str) -> str:
-    """Prompt for a child being re-activated with follow-up work."""
+    """Re-activate a child with follow-up work."""
 
     return f"""\
-## Reactivation
+You previously completed: {original_task}
+What you did: {previous_summary or "(unknown)"}
 
-You previously worked on this domain and completed the following:
+New task: {new_task}
 
-### Original task
-{original_task}
+Implement the changes, commit, and return:
+{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+"""
 
-### What you did
-{previous_summary or "(no summary available)"}
 
-### New follow-up task
-{new_task}
+def conflict_resolution_prompt(child_id: str, conflict_files: list[str], conflict_diff: str) -> str:
+    """Resolve merge conflicts from a child's cherry-pick."""
 
-## Instructions
-1. Review your previous work in the worktree.
-2. Implement the follow-up changes.
-3. Stage and commit all changes.
-4. Return a JSON result.
+    files_list = ", ".join(conflict_files)
 
-```json
-{{"status": "implemented", "summary": "what you changed", "changed_files": ["..."], "commit_sha": "..."}}
+    return f"""\
+Cherry-picking child {child_id} conflicted in: {files_list}
+
+```diff
+{conflict_diff[:10000]}
 ```
 
-Return ONLY the JSON object after committing.
+Resolve all conflicts, stage, and commit. Return:
+{{"status": "resolved", "summary": "...", "resolved_files": ["..."]}}
+
+If irreconcilable:
+{{"status": "irreconcilable", "reason": "..."}}
 """

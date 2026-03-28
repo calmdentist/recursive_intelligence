@@ -49,6 +49,7 @@ class AgentAdapter(ABC):
         system_prompt: str | None = None,
         resume_session_id: str | None = None,
         on_message: StreamCallback = None,
+        is_root: bool = False,
     ) -> NodeResult:
         """Run (or resume) an agent session to completion.
 
@@ -59,6 +60,7 @@ class AgentAdapter(ABC):
             system_prompt: Optional system prompt override.
             resume_session_id: If set, resume this existing session.
             on_message: Optional callback for streaming intermediate events.
+            is_root: If True, this is the root node (may get enhanced model config).
 
         Returns:
             NodeResult with session_id, parsed output, and cost info.

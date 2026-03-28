@@ -32,7 +32,7 @@ class TimedAdapter(AgentAdapter):
     def peak_concurrency(self) -> int:
         return self._concurrent_peak
 
-    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
         async with self._lock:
             self._concurrent_now += 1
             if self._concurrent_now > self._concurrent_peak:

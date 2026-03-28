@@ -21,7 +21,12 @@ from typing import Any
 from recursive_intelligence.adapters.base import AgentAdapter, StreamCallback
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.git.diffing import ArtifactBundle, build_artifact_bundle
-from recursive_intelligence.git.merge import cherry_pick_child, abort_cherry_pick
+from recursive_intelligence.git.merge import (
+    cherry_pick_child,
+    abort_cherry_pick,
+    get_conflict_diff,
+    stage_and_continue_cherry_pick,
+)
 from recursive_intelligence.git.worktrees import (
     branch_name,
     create_worktree,
@@ -36,6 +41,7 @@ from recursive_intelligence.adapters.claude.prompts import (
     revision_prompt,
     routing_prompt,
     reactivation_prompt,
+    conflict_resolution_prompt,
 )
 from recursive_intelligence.runtime.node_fsm import (
     ChildSpec,
@@ -59,6 +65,15 @@ class Orchestrator:
         self.store: StateStore | None = None
         self._on_message = on_message
         self._root_node_id: str | None = None
+
+    def _is_root(self, node_id: str) -> bool:
+        """Check if a node is the root node of its run."""
+        store = self._ensure_store()
+        node = store.get_node(node_id)
+        if node is None:
+            return False
+        run = store.get_run(node.run_id)
+        return run is not None and run.root_node_id == node_id
 
     def _ensure_store(self) -> StateStore:
         if self.store is None:
@@ -230,6 +245,7 @@ class Orchestrator:
                 prompt=prompt, worktree=worktree, mode="plan",
                 resume_session_id=node.session_id if is_routing else None,
                 on_message=self._stream_callback_for(node.node_id),
+                is_root=self._is_root(node.node_id),
             )
         except Exception as e:
             log.error("Planning failed for %s: %s", node.node_id, e)
@@ -352,6 +368,7 @@ class Orchestrator:
                 prompt=prompt, worktree=worktree, mode="execute",
                 resume_session_id=resume_id,
                 on_message=self._stream_callback_for(node.node_id),
+                is_root=self._is_root(node.node_id),
             )
         except Exception as e:
             log.error("Execution failed for %s: %s", node.node_id, e)
@@ -530,7 +547,8 @@ class Orchestrator:
                     return
                 continue
 
-            if child.state != NodeState.COMPLETED or not child.worktree_path:
+            # PAUSED children have completed their work (merged and paused) — treat as reviewable
+            if child.state not in (NodeState.COMPLETED, NodeState.PAUSED) or not child.worktree_path:
                 if child.state in (NodeState.FAILED, NodeState.CANCELLED):
                     verdict = ReviewVerdict(
                         child_id=child.node_id, verdict="reject",
@@ -571,6 +589,7 @@ class Orchestrator:
                     prompt=prompt, worktree=parent_wt, mode="review",
                     resume_session_id=node.session_id,
                     on_message=self._stream_callback_for(node.node_id),
+                    is_root=self._is_root(node.node_id),
                 )
             except Exception as e:
                 log.error("Review failed for %s: %s", child.node_id, e)
@@ -684,20 +703,119 @@ class Orchestrator:
 
             if result.status == "conflict":
                 log.warning("Conflict integrating %s: %s", child.node_id, result.conflict_files)
-                abort_cherry_pick(parent_wt)
-                fsm.fail(
-                    f"Cherry-pick conflict with {child.node_id}",
-                    failure_type="merge_conflict",
+                resolved = await self._resolve_conflict(
+                    fsm, parent_wt, child.node_id,
+                    result.conflict_files or [],
                 )
-                return
+                if not resolved:
+                    abort_cherry_pick(parent_wt)
+                    fsm.fail(
+                        f"Irreconcilable conflict with {child.node_id}",
+                        failure_type="merge_conflict",
+                    )
+                    return
+                # Record the successful resolution
+                new_sha = get_head_sha(parent_wt)
+                store.append_event(node.run_id, node.node_id, "conflict_resolved", {
+                    "child_id": child.node_id,
+                    "conflict_files": result.conflict_files,
+                    "resolved_sha": new_sha,
+                })
 
         final_sha = get_head_sha(parent_wt)
-        if run and run.persistent:
+        # Only the root node pauses in persistent mode — children always complete
+        is_root = run and run.root_node_id == node.node_id
+        if is_root and run.persistent:
             fsm.pause_after_merge(final_sha)
             log.info("Node %s merged and paused at %s", node.node_id, final_sha[:8])
         else:
             fsm.finish_merge(final_sha)
             log.info("Node %s merged at %s", node.node_id, final_sha[:8])
+
+    # --- Conflict resolution ---
+
+    async def _resolve_conflict(
+        self,
+        fsm: NodeFSM,
+        parent_wt: Path,
+        child_id: str,
+        conflict_files: list[str],
+    ) -> bool:
+        """Ask the parent node to resolve a merge conflict. Returns True if resolved."""
+        store = self._ensure_store()
+        node = fsm.node
+
+        # Get the conflict diff showing markers
+        conflict_diff = get_conflict_diff(parent_wt)
+        if not conflict_diff:
+            log.error("No conflict diff available for %s", child_id)
+            return False
+
+        prompt = conflict_resolution_prompt(child_id, conflict_files, conflict_diff)
+
+        log.info("Asking parent %s to resolve conflict with %s (%s)",
+                 node.node_id, child_id, conflict_files)
+
+        try:
+            result = await self.adapter.run(
+                prompt=prompt,
+                worktree=parent_wt,
+                mode="execute",  # needs edit permissions to resolve
+                resume_session_id=node.session_id,
+                on_message=self._stream_callback_for(node.node_id),
+                is_root=self._is_root(node.node_id),
+            )
+        except Exception as e:
+            log.error("Conflict resolution failed for %s: %s", child_id, e)
+            return False
+
+        store.update_node(node.node_id, session_id=result.session_id)
+
+        raw = result.raw
+        status = raw.get("status", "")
+
+        if status == "irreconcilable":
+            log.warning("Parent declared conflict irreconcilable: %s",
+                        raw.get("reason", ""))
+            return False
+
+        # Whether the LLM said "resolved" or returned unexpected JSON,
+        # we need to ensure the cherry-pick is actually finalized.
+        # The LLM may have edited files but not committed, or committed
+        # but CHERRY_PICK_HEAD still exists. Use stage_and_continue to
+        # guarantee the cherry-pick is complete.
+        return self._finalize_cherry_pick(parent_wt, child_id, raw.get("summary", ""))
+
+    def _finalize_cherry_pick(self, worktree: Path, child_id: str, summary: str) -> bool:
+        """Ensure a cherry-pick is fully completed after LLM conflict resolution.
+
+        Handles cases where the LLM:
+        - Resolved conflicts and committed correctly (CHERRY_PICK_HEAD gone → no-op)
+        - Resolved conflicts but didn't commit (stage + continue)
+        - Staged files but CHERRY_PICK_HEAD still exists (continue)
+        """
+        import subprocess
+
+        # Check if CHERRY_PICK_HEAD still exists — means cherry-pick isn't done
+        cp_head = subprocess.run(
+            ["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"],
+            cwd=str(worktree), capture_output=True, text=True,
+        )
+
+        if cp_head.returncode != 0:
+            # No CHERRY_PICK_HEAD — the LLM committed correctly
+            log.info("Cherry-pick already finalized for %s: %s", child_id, summary)
+            return True
+
+        # CHERRY_PICK_HEAD exists — finalize the cherry-pick
+        log.info("CHERRY_PICK_HEAD still exists for %s, finalizing", child_id)
+        try:
+            stage_and_continue_cherry_pick(worktree)
+            log.info("Cherry-pick finalized for %s", child_id)
+            return True
+        except Exception as e:
+            log.error("Failed to finalize cherry-pick for %s: %s", child_id, e)
+            return False
 
     # --- Cleanup ---
 
