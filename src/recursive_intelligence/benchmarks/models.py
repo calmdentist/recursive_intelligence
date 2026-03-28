@@ -61,6 +61,8 @@ class PatchScore:
     test_command: str
     log_path: str | None = None
     error: str | None = None
+    python_executable: str | None = None
+    python_requirement: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,6 +117,8 @@ class ModeAggregate:
     solve_rate: float
     solved: int
     total: int
+    eligible: int
+    unsupported: int
     avg_cost_usd: float
     avg_latency_ms: float
     median_latency_ms: float
@@ -134,6 +138,7 @@ class ComparisonAggregate:
     recursive_win: int
     tie_solved: int
     tie_failed: int
+    unsupported: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

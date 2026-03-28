@@ -85,6 +85,13 @@ def _cols() -> int:
 def _hr() -> str:
     return _dim("\u2500" * _cols())
 
+
+def _format_unsupported(count: int) -> str:
+    if count <= 0:
+        return ""
+    label = "task" if count == 1 else "tasks"
+    return f" {_dim(f'({count} unsupported {label})')}"
+
 INDENT = "  "
 
 
@@ -388,8 +395,16 @@ def benchmark_swebench(
 
         click.echo(f"{INDENT}{_dim('benchmark')} {report.run_id}")
         click.echo(f"{INDENT}{_dim('tasks')}      {report.task_count}")
-        click.echo(f"{INDENT}{_dim('baseline')}   {report.baseline.solved}/{report.baseline.total} solved")
-        click.echo(f"{INDENT}{_dim('recursive')}  {report.recursive.solved}/{report.recursive.total} solved")
+        click.echo(
+            f"{INDENT}{_dim('baseline')}   "
+            f"{report.baseline.solved}/{report.baseline.eligible} solved"
+            f"{_format_unsupported(report.baseline.unsupported)}"
+        )
+        click.echo(
+            f"{INDENT}{_dim('recursive')}  "
+            f"{report.recursive.solved}/{report.recursive.eligible} solved"
+            f"{_format_unsupported(report.recursive.unsupported)}"
+        )
         click.echo(f"{INDENT}{_dim('report')}     {config.benchmarks_dir / report.run_id / 'report.json'}")
     except Exception as e:
         click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
