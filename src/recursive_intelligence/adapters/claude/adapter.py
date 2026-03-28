@@ -17,12 +17,22 @@ log = logging.getLogger(__name__)
 class ClaudeAdapter(AgentAdapter):
     """Claude Code adapter using the Anthropic Agent SDK."""
 
-    def __init__(self, model: str = "claude-sonnet-4-6") -> None:
-        self._model = model
+    def __init__(
+        self,
+        model: str | None = None,
+        root_model: str | None = None,
+        child_model: str | None = None,
+    ) -> None:
+        shared_model = model or "claude-sonnet-4-6"
+        self._root_model = root_model or shared_model
+        self._child_model = child_model or shared_model
 
     @property
     def name(self) -> str:
         return "claude"
+
+    def _model_for_node(self, is_root: bool) -> str:
+        return self._root_model if is_root else self._child_model
 
     async def run(
         self,
@@ -49,9 +59,7 @@ class ClaudeAdapter(AgentAdapter):
         mode_config = get_mode_config(mode)
         sys_prompt = system_prompt or SYSTEM_CONTRACT
 
-        # All nodes use Opus 4.6 with adaptive thinking.
-        # Root node additionally gets 1M context window.
-        model = "claude-opus-4-6"
+        model = self._model_for_node(is_root)
         betas = ["context-1m-2025-08-07"] if is_root else []
 
         if resume_session_id:

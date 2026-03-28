@@ -367,7 +367,9 @@ def benchmark(ctx: click.Context) -> None:
 @click.option("--limit", type=int, default=None, help="Optional task limit")
 @click.option("--refresh", is_flag=True, help="Refresh the cached dataset")
 @click.option("--keep-task-dirs", is_flag=True, help="Keep cloned task directories after the run")
-@click.option("--model", default="claude-opus-4-6", help="Model to use")
+@click.option("--model", default="claude-opus-4-6", help="Fallback model for both root and child nodes")
+@click.option("--root-model", default=None, help="Claude model for baseline and recursive root nodes")
+@click.option("--child-model", default=None, help="Claude model for recursive child nodes")
 @click.option(
     "--namespace",
     default=None,
@@ -383,6 +385,8 @@ def benchmark_swebench(
     refresh: bool,
     keep_task_dirs: bool,
     model: str,
+    root_model: str | None,
+    child_model: str | None,
     namespace: str | None,
 ) -> None:
     """Benchmark recursive intelligence on SWE-bench."""
@@ -399,6 +403,8 @@ def benchmark_swebench(
         runner = BenchmarkRunner(
             config,
             model=model,
+            root_model=root_model,
+            child_model=child_model,
             keep_task_dirs=keep_task_dirs,
             evaluation_namespace=namespace,
         )
