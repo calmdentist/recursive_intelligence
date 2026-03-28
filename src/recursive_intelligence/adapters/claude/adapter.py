@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult
+from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult, StreamCallback
 from recursive_intelligence.adapters.claude.parser import extract_json, ParseError
 from recursive_intelligence.adapters.claude.permissions import get_mode_config
 from recursive_intelligence.adapters.claude.prompts import SYSTEM_CONTRACT
@@ -31,18 +31,23 @@ class ClaudeAdapter(AgentAdapter):
         mode: str,
         system_prompt: str | None = None,
         resume_session_id: str | None = None,
+        on_message: StreamCallback = None,
     ) -> NodeResult:
         from claude_agent_sdk import (
+            AssistantMessage,
             ClaudeAgentOptions,
             ResultMessage,
             SystemMessage,
+            TextBlock,
+            ThinkingBlock,
+            ToolResultBlock,
+            ToolUseBlock,
             query,
         )
 
         mode_config = get_mode_config(mode)
         sys_prompt = system_prompt or SYSTEM_CONTRACT
 
-        # Build options — cwd is always required (the CLI process needs it)
         if resume_session_id:
             options = ClaudeAgentOptions(
                 cwd=str(worktree),
@@ -73,10 +78,39 @@ class ClaudeAdapter(AgentAdapter):
             mode, resume_session_id or "(new)", worktree,
         )
 
+        def _emit(msg_type: str, data: dict[str, Any]) -> None:
+            if on_message:
+                try:
+                    on_message(msg_type, data)
+                except Exception:
+                    pass  # never let UI errors kill the session
+
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, SystemMessage) and message.subtype == "init":
                 session_id = message.data.get("session_id", session_id)
                 log.debug("Session ID: %s", session_id)
+
+            elif isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        _emit("text", {"text": block.text})
+                    elif isinstance(block, ThinkingBlock):
+                        _emit("thinking", {"text": block.thinking})
+                    elif isinstance(block, ToolUseBlock):
+                        _emit("tool_use", {
+                            "tool": block.name,
+                            "input": block.input if hasattr(block, "input") else {},
+                        })
+                    elif isinstance(block, ToolResultBlock):
+                        content = ""
+                        if hasattr(block, "content") and block.content:
+                            if isinstance(block.content, str):
+                                content = block.content
+                            elif isinstance(block.content, list):
+                                content = " ".join(
+                                    str(getattr(c, "text", c)) for c in block.content
+                                )
+                        _emit("tool_result", {"content": content[:500]})
 
             elif isinstance(message, ResultMessage):
                 result_text = message.result or ""

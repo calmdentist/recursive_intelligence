@@ -30,7 +30,7 @@ class ScriptedAdapter(AgentAdapter):
     def calls(self) -> list[dict]:
         return self._call_log
 
-    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None):
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
         if not self._responses:
             raise RuntimeError("ScriptedAdapter ran out of responses")
 
@@ -389,7 +389,7 @@ class TestCherryPickConflict:
             def name(self):
                 return "conflict"
 
-            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None):
+            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
                 resp = self._responses.pop(0)
                 self._call_count += 1
                 raw = {k: v for k, v in resp.items() if not k.startswith("_")}

@@ -64,11 +64,18 @@ def list_worktrees(repo_root: Path) -> list[dict[str, str]]:
 
 
 def ensure_clean_repo(repo_root: Path) -> None:
-    """Raise if the repo has uncommitted changes."""
-    status = _git(repo_root, "status", "--porcelain")
+    """Raise if the repo has uncommitted changes to tracked files.
+
+    Untracked files are fine — we only care about modifications to
+    files git is already tracking, since worktrees branch from HEAD.
+    """
+    # Only check for modifications/deletions/renames of tracked files.
+    # Exclude untracked files (lines starting with '?') and ignored files.
+    status = _git(repo_root, "status", "--porcelain", "-uno")
     if status.strip():
         raise WorktreeError(
-            f"Repo at {repo_root} has uncommitted changes. Commit or stash before starting a run."
+            f"Repo at {repo_root} has uncommitted changes to tracked files. "
+            f"Commit or stash before starting a run.\n{status.strip()}"
         )
 
 

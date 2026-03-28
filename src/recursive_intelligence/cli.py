@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -29,6 +31,7 @@ YELLOW = "\033[33m"
 CYAN = "\033[36m"
 WHITE = "\033[37m"
 MAGENTA = "\033[35m"
+BLUE = "\033[34m"
 CLEAR_LINE = "\033[2K\r"
 
 STATE_STYLE = {
@@ -46,37 +49,32 @@ STATE_STYLE = {
 }
 
 
-def _styled_state(state: str) -> str:
+def _s(state: str) -> str:
     return STATE_STYLE.get(state, state)
 
+def _dim(t: str) -> str:
+    return f"{DIM}{t}{RESET}"
 
-def _dim(text: str) -> str:
-    return f"{DIM}{text}{RESET}"
+def _bold(t: str) -> str:
+    return f"{BOLD}{t}{RESET}"
 
+def _cyan(t: str) -> str:
+    return f"{CYAN}{t}{RESET}"
 
-def _bold(text: str) -> str:
-    return f"{BOLD}{text}{RESET}"
+def _green(t: str) -> str:
+    return f"{GREEN}{t}{RESET}"
 
+def _yellow(t: str) -> str:
+    return f"{YELLOW}{t}{RESET}"
 
-def _cyan(text: str) -> str:
-    return f"{CYAN}{text}{RESET}"
+def _red(t: str) -> str:
+    return f"{RED}{t}{RESET}"
 
+def _magenta(t: str) -> str:
+    return f"{MAGENTA}{t}{RESET}"
 
-def _green(text: str) -> str:
-    return f"{GREEN}{text}{RESET}"
-
-
-def _yellow(text: str) -> str:
-    return f"{YELLOW}{text}{RESET}"
-
-
-def _red(text: str) -> str:
-    return f"{RED}{text}{RESET}"
-
-
-def _magenta(text: str) -> str:
-    return f"{MAGENTA}{text}{RESET}"
-
+def _blue(t: str) -> str:
+    return f"{BLUE}{t}{RESET}"
 
 def _cols() -> int:
     try:
@@ -84,9 +82,10 @@ def _cols() -> int:
     except OSError:
         return 80
 
-
 def _hr() -> str:
     return _dim("\u2500" * _cols())
+
+INDENT = "  "
 
 
 # ── Banner ───────────────────────────────────────────────────────────────────
@@ -102,27 +101,114 @@ BANNER = f"""\
 {RESET}"""
 
 
-def _print_banner() -> None:
-    click.echo(BANNER, nl=False)
+def _setup_logging(verbose: bool, chat_mode: bool, config: RuntimeConfig) -> None:
+    if chat_mode and not verbose:
+        config.ensure_dirs()
+        log_path = config.ri_dir / "rari.log"
+        handler = logging.FileHandler(str(log_path), mode="a")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.root.handlers = [handler]
+        logging.root.setLevel(logging.INFO)
+    else:
+        level = logging.DEBUG if verbose else logging.INFO
+        logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
-def _print_chat_help() -> None:
-    click.echo(f"  {_dim('Commands:')} /tree  /domains  /status  /help  /done  /quit")
-    click.echo()
+# ── Stream renderer ──────────────────────────────────────────────────────────
 
+class StreamRenderer:
+    """Renders streaming events from the root node, Claude Code style.
 
-PROMPT = f"  {BOLD}{CYAN}\u276f{RESET} "
+    Called from the background thread — all output goes through
+    thread-safe sys.stderr.write to avoid interleaving with click prompts.
+    """
+
+    def __init__(self) -> None:
+        self._in_text = False
+        self._lock = threading.Lock()
+
+    def on_message(self, msg_type: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            if msg_type == "text":
+                self._render_text(data.get("text", ""))
+            elif msg_type == "thinking":
+                self._render_thinking(data.get("text", ""))
+            elif msg_type == "tool_use":
+                self._render_tool_use(data.get("tool", ""), data.get("input", {}))
+            elif msg_type == "tool_result":
+                self._render_tool_result(data.get("content", ""))
+
+    def _write(self, text: str) -> None:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+    def _end_text(self) -> None:
+        if self._in_text:
+            self._write("\n")
+            self._in_text = False
+
+    def _render_text(self, text: str) -> None:
+        if not text:
+            return
+        if not self._in_text:
+            self._write(f"\n{INDENT}")
+            self._in_text = True
+        # Wrap long lines
+        for line in text.split("\n"):
+            self._write(f"{line}\n{INDENT}")
+
+    def _render_thinking(self, text: str) -> None:
+        self._end_text()
+        # Show thinking as a compact dimmed block
+        if not text.strip():
+            return
+        lines = text.strip().split("\n")
+        preview = lines[0][:80]
+        if len(lines) > 1 or len(lines[0]) > 80:
+            preview += "..."
+        self._write(f"{INDENT}{DIM}\u2501 {preview}{RESET}\n")
+
+    def _render_tool_use(self, tool: str, tool_input: dict) -> None:
+        self._end_text()
+        # Format like Claude Code: tool name + key argument
+        arg_summary = self._summarize_tool_input(tool, tool_input)
+        self._write(f"{INDENT}{CYAN}\u25b8 {tool}{RESET}")
+        if arg_summary:
+            self._write(f" {DIM}{arg_summary}{RESET}")
+        self._write("\n")
+
+    def _render_tool_result(self, content: str) -> None:
+        if not content or not content.strip():
+            return
+        # Show a compact preview of the result
+        lines = content.strip().split("\n")
+        preview = lines[0][:100]
+        if len(lines) > 1:
+            preview += f" {DIM}(+{len(lines)-1} lines){RESET}"
+        self._write(f"{INDENT}  {DIM}{preview}{RESET}\n")
+
+    def _summarize_tool_input(self, tool: str, inp: dict) -> str:
+        if tool in ("Read", "Glob", "Grep"):
+            path = inp.get("file_path") or inp.get("path") or inp.get("pattern") or ""
+            return str(path)
+        if tool in ("Edit", "Write"):
+            return str(inp.get("file_path", ""))
+        if tool == "Bash":
+            cmd = inp.get("command", "")
+            return cmd[:60] if cmd else ""
+        if tool == "Agent":
+            return inp.get("description", "")[:40]
+        return ""
+
+    def finish(self) -> None:
+        """Call when the session is done to clean up."""
+        with self._lock:
+            self._end_text()
 
 
 # ── Background runner ────────────────────────────────────────────────────────
 
 class BackgroundRunner:
-    """Runs orchestrator passes in a background thread.
-
-    The prompt stays live while the orchestrator works. Slash commands
-    read from the SQLite DB which is updated in real-time.
-    """
-
     def __init__(self, orchestrator: Orchestrator, config: RuntimeConfig) -> None:
         self.orchestrator = orchestrator
         self.config = config
@@ -131,13 +217,15 @@ class BackgroundRunner:
         self._error: Exception | None = None
         self._queued_input: str | None = None
         self._lock = threading.Lock()
+        self.renderer = StreamRenderer()
 
     @property
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def start_run(self, task: str) -> None:
-        """Start a new persistent run in the background."""
+        self.orchestrator._on_message = self.renderer.on_message
+
         def _work():
             try:
                 self.run_id = asyncio.run(
@@ -145,15 +233,17 @@ class BackgroundRunner:
                 )
             except Exception as e:
                 self._error = e
+            finally:
+                self.renderer.finish()
 
         self._error = None
         self._thread = threading.Thread(target=_work, daemon=True)
         self._thread.start()
 
     def continue_run(self, user_input: str) -> None:
-        """Continue a paused run in the background."""
         if self.run_id is None:
             return
+        self.orchestrator._on_message = self.renderer.on_message
 
         def _work():
             try:
@@ -162,13 +252,14 @@ class BackgroundRunner:
                 )
             except Exception as e:
                 self._error = e
+            finally:
+                self.renderer.finish()
 
         self._error = None
         self._thread = threading.Thread(target=_work, daemon=True)
         self._thread.start()
 
     def queue_input(self, text: str) -> None:
-        """Queue input to be sent after the current pass finishes."""
         with self._lock:
             self._queued_input = text
 
@@ -179,7 +270,6 @@ class BackgroundRunner:
             return q
 
     def wait_done(self, timeout: float = 0.3) -> bool:
-        """Wait briefly for the background task. Returns True if done."""
         if self._thread is None:
             return True
         self._thread.join(timeout=timeout)
@@ -189,30 +279,6 @@ class BackgroundRunner:
         e = self._error
         self._error = None
         return e
-
-    def get_status_line(self) -> str:
-        """Build a one-line status from live DB state."""
-        if not self.run_id:
-            return ""
-        try:
-            store = StateStore(self.config.db_path)
-            nodes = store.get_run_nodes(self.run_id)
-            store.close()
-        except Exception:
-            return ""
-
-        active = [n for n in nodes if not n.state.is_idle]
-        if not active:
-            return ""
-
-        parts = []
-        for n in active[:3]:
-            domain = ""
-            task = n.task_spec[:25]
-            parts.append(f"{_styled_state(n.state.value)} {_dim(task)}")
-
-        suffix = f" {_dim(f'+{len(active)-3} more')}" if len(active) > 3 else ""
-        return "  " + "  ".join(parts) + suffix
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -224,44 +290,34 @@ class BackgroundRunner:
 @click.pass_context
 def main(ctx: click.Context, repo: str, verbose: bool, model: str) -> None:
     """rari - recursive intelligence runtime"""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
     ctx.ensure_object(dict)
     ctx.obj["config"] = RuntimeConfig(repo_root=Path(repo).resolve())
     ctx.obj["model"] = model
+    ctx.obj["verbose"] = verbose
 
     if ctx.invoked_subcommand is None:
-        ctx.invoke(chat, run_id=None, model=model)
+        from recursive_intelligence.tui import run_tui
+        run_tui(ctx.obj["config"], model)
 
 
 @main.command()
 @click.argument("task")
 @click.option("--model", default="claude-sonnet-4-6", help="Model to use")
 @click.option("--persistent", is_flag=True, help="Keep run alive for follow-up passes")
-@click.option("--cleanup/--no-cleanup", default=False, help="Remove worktrees after run")
 @click.pass_context
-def run(ctx: click.Context, task: str, model: str, persistent: bool, cleanup: bool) -> None:
+def run(ctx: click.Context, task: str, model: str, persistent: bool) -> None:
     """Start a new recursive run."""
     config: RuntimeConfig = ctx.obj["config"]
-    _print_banner()
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
 
     adapter = _make_adapter(model)
     orchestrator = Orchestrator(config, adapter)
 
-    click.echo(f"  {_dim('model')}  {model}")
-    click.echo(f"  {_dim('repo')}   {config.repo_root}")
-    click.echo(f"  {_dim('mode')}   {'persistent' if persistent else 'one-shot'}")
-    click.echo()
-
     try:
         run_id = asyncio.run(orchestrator.start_run(task, persistent=persistent))
         _print_run_result(config, run_id)
-
-        if cleanup:
-            orchestrator.cleanup_worktrees(run_id)
-            click.echo(_dim("  Worktrees cleaned up."))
     except Exception as e:
-        click.echo(f"\n  {_red('error')} {e}", err=True)
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
         sys.exit(1)
 
 
@@ -272,29 +328,20 @@ def run(ctx: click.Context, task: str, model: str, persistent: bool, cleanup: bo
 def baseline(ctx: click.Context, task: str, model: str) -> None:
     """Run a single flat Claude session (no recursion)."""
     config: RuntimeConfig = ctx.obj["config"]
-    _print_banner()
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
 
     from recursive_intelligence.runtime.baseline import BaselineRunner
 
     adapter = _make_adapter(model)
     runner = BaselineRunner(config, adapter)
 
-    click.echo(f"  {_dim('mode')}   baseline (flat, no recursion)")
-    click.echo()
-
     try:
         report = asyncio.run(runner.run(task))
-        click.echo()
-        click.echo(f"  {_dim('run')}      {report.run_id}")
-        click.echo(f"  {_dim('status')}   {_styled_state(report.status)}")
-        click.echo(f"  {_dim('cost')}     ${report.cost.total_usd:.4f}")
-        click.echo(f"  {_dim('turns')}    {report.num_turns}")
-        click.echo(f"  {_dim('time')}     {report.duration_ms}ms")
-        if report.changed_files:
-            click.echo(f"  {_dim('changed')}  {', '.join(report.changed_files)}")
-        click.echo()
+        click.echo(f"{INDENT}{_dim('status')}  {_s(report.status)}")
+        click.echo(f"{INDENT}{_dim('cost')}    ${report.cost.total_usd:.4f}")
+        click.echo(f"{INDENT}{_dim('turns')}   {report.num_turns}")
     except Exception as e:
-        click.echo(f"\n  {_red('error')} {e}", err=True)
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
         sys.exit(1)
 
 
@@ -306,6 +353,7 @@ def baseline(ctx: click.Context, task: str, model: str) -> None:
 def continue_run(ctx: click.Context, run_id: str, task: str, model: str) -> None:
     """Continue a paused persistent run with new instructions."""
     config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
 
     adapter = _make_adapter(model)
     orchestrator = Orchestrator(config, adapter)
@@ -314,7 +362,7 @@ def continue_run(ctx: click.Context, run_id: str, task: str, model: str) -> None
         asyncio.run(orchestrator.continue_run(run_id, task))
         _print_run_result(config, run_id)
     except Exception as e:
-        click.echo(f"\n  {_red('error')} {e}", err=True)
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
         sys.exit(1)
 
 
@@ -325,14 +373,17 @@ def continue_run(ctx: click.Context, run_id: str, task: str, model: str) -> None
 def chat(ctx: click.Context, run_id: str | None, model: str) -> None:
     """Interactive session with a persistent run."""
     config: RuntimeConfig = ctx.obj["config"]
-    _print_banner()
+    _setup_logging(ctx.obj["verbose"], chat_mode=True, config=config)
+
+    click.echo(BANNER, nl=False)
 
     adapter = _make_adapter(model)
     orchestrator = Orchestrator(config, adapter)
     runner = BackgroundRunner(orchestrator, config)
 
-    click.echo(f"  {_dim('model')}  {model}")
-    click.echo(f"  {_dim('repo')}   {config.repo_root}")
+    click.echo(f"{INDENT}{_dim('model')}  {model}")
+    click.echo(f"{INDENT}{_dim('repo')}   {config.repo_root}")
+    click.echo(f"{INDENT}{_dim('tips')}   /tree /domains /status /help /quit")
     click.echo()
 
     if run_id:
@@ -341,31 +392,30 @@ def chat(ctx: click.Context, run_id: str | None, model: str) -> None:
         run_record = store.get_run(run_id)
         store.close()
         if run_record is None:
-            click.echo(f"  {_red('error')} Run {run_id} not found", err=True)
+            click.echo(f"{INDENT}{_red('error')} Run {run_id} not found", err=True)
             sys.exit(1)
         runner.run_id = run_id
-        click.echo(f"  {_dim('resuming')} {run_id} {_dim('(pass')} {run_record.pass_count}{_dim(')')}")
+        click.echo(f"{INDENT}{_dim('resuming')} {run_id} {_dim('pass')} {run_record.pass_count}")
         click.echo()
-        _print_chat_help()
-    else:
-        _print_chat_help()
 
     # ── Main REPL loop ───────────────────────────────────────────────────
     while True:
-        # If busy, show status and poll for completion
+        # If background is done, collect result
         if runner.busy:
-            _wait_with_status(runner, config)
+            # Wait for background to finish — streaming happens via the
+            # renderer callback, so we just poll completion
+            while runner.busy:
+                runner.wait_done(timeout=0.3)
+
             err = runner.collect_error()
             if err:
-                click.echo(f"  {_red('error')} {err}")
+                click.echo(f"\n{INDENT}{_red('error')} {err}\n")
             elif runner.run_id:
-                _print_run_result(config, runner.run_id)
+                _print_pass_summary(config, runner.run_id)
 
-            # Check for queued input
             queued = runner.pop_queued()
             if queued:
-                click.echo(f"  {_dim('sending queued input...')}")
-                click.echo()
+                click.echo(f"\n{INDENT}{_dim('sending queued input...')}\n")
                 runner.continue_run(queued)
                 continue
 
@@ -374,21 +424,18 @@ def chat(ctx: click.Context, run_id: str | None, model: str) -> None:
         if not user_input:
             continue
 
-        # Slash commands work any time
         if user_input.startswith("/"):
             if _handle_slash_command(user_input, config, runner):
                 break
             continue
 
-        # If orchestrator is busy, queue the input
         if runner.busy:
             runner.queue_input(user_input)
-            click.echo(f"  {_dim('Queued. Will send after current pass completes.')}")
+            click.echo(f"{INDENT}{_dim('queued - will send after current pass')}")
             continue
 
         click.echo()
 
-        # First message starts a new run
         if runner.run_id is None:
             runner.start_run(user_input)
         else:
@@ -401,15 +448,16 @@ def chat(ctx: click.Context, run_id: str | None, model: str) -> None:
 def resume(ctx: click.Context, run_id: str) -> None:
     """Resume a crashed/interrupted run."""
     config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
 
     adapter = _make_adapter()
     orchestrator = Orchestrator(config, adapter)
 
     try:
         asyncio.run(orchestrator.resume_run(run_id))
-        click.echo(f"  {_green('done')} Run resumed: {run_id}")
+        click.echo(f"{INDENT}{_green('done')} Run resumed: {run_id}")
     except Exception as e:
-        click.echo(f"  {_red('error')} {e}", err=True)
+        click.echo(f"{INDENT}{_red('error')} {e}", err=True)
         sys.exit(1)
 
 
@@ -419,18 +467,16 @@ def resume(ctx: click.Context, run_id: str) -> None:
 def tree(ctx: click.Context, run_id: str) -> None:
     """Display the node tree for a run."""
     config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
     config.ensure_dirs()
     store = StateStore(config.db_path)
-
     tree_data = get_node_tree(store, run_id)
-    if not tree_data:
-        click.echo(_dim("  No nodes."))
-        store.close()
-        return
-
-    click.echo()
-    _print_tree(tree_data[0])
-    click.echo()
+    if tree_data:
+        click.echo()
+        _print_tree(tree_data[0])
+        click.echo()
+    else:
+        click.echo(_dim(f"{INDENT}No nodes."))
     store.close()
 
 
@@ -440,49 +486,41 @@ def tree(ctx: click.Context, run_id: str) -> None:
 def inspect(ctx: click.Context, node_id: str) -> None:
     """Inspect a single node's state and events."""
     config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
     config.ensure_dirs()
     store = StateStore(config.db_path)
 
     node = store.get_node(node_id)
     if node is None:
-        click.echo(f"  {_red('error')} Node {node_id} not found")
+        click.echo(f"{INDENT}{_red('error')} Node {node_id} not found")
         store.close()
         return
 
     click.echo()
-    click.echo(f"  {_bold(node.node_id)}")
-    click.echo(f"  {_dim('run')}      {node.run_id}")
-    click.echo(f"  {_dim('parent')}   {node.parent_id or _dim('(root)')}")
-    click.echo(f"  {_dim('state')}    {_styled_state(node.state.value)}")
-    click.echo(f"  {_dim('task')}     {node.task_spec}")
-
+    click.echo(f"{INDENT}{_bold(node.node_id)}")
+    click.echo(f"{INDENT}{_dim('state')}    {_s(node.state.value)}")
+    click.echo(f"{INDENT}{_dim('task')}     {node.task_spec}")
     if node.worktree_path:
-        click.echo(f"  {_dim('worktree')} {node.worktree_path}")
-    if node.branch_name:
-        click.echo(f"  {_dim('branch')}   {node.branch_name}")
+        click.echo(f"{INDENT}{_dim('worktree')} {node.worktree_path}")
 
     domain = store.get_domain_by_child(node_id)
     if domain:
-        click.echo(f"  {_dim('domain')}   {_magenta(domain.domain_name)}")
-        if domain.file_patterns:
-            click.echo(f"  {_dim('files')}    {', '.join(domain.file_patterns)}")
-        if domain.module_scope:
-            click.echo(f"  {_dim('scope')}    {domain.module_scope}")
+        click.echo(f"{INDENT}{_dim('domain')}   {_magenta(domain.domain_name)}")
 
     events = store.get_node_events(node_id)
     if events:
-        click.echo(f"\n  {_dim('events')} ({len(events)})")
+        click.echo(f"\n{INDENT}{_dim('events')} ({len(events)})")
         for evt in events:
             ts = evt.timestamp.split("T")[1][:8] if "T" in evt.timestamp else evt.timestamp
-            click.echo(f"    {_dim(ts)} {evt.event_type}")
+            click.echo(f"{INDENT}  {_dim(ts)} {evt.event_type}")
 
     children = store.get_children(node_id)
     if children:
-        click.echo(f"\n  {_dim('children')} ({len(children)})")
+        click.echo(f"\n{INDENT}{_dim('children')} ({len(children)})")
         for child in children:
             d = store.get_domain_by_child(child.node_id)
-            domain_tag = f" {_magenta(d.domain_name)}" if d else ""
-            click.echo(f"    {_styled_state(child.state.value):>20s}{domain_tag}  {child.task_spec[:50]}")
+            dtag = f" {_magenta(d.domain_name)}" if d else ""
+            click.echo(f"{INDENT}  {_s(child.state.value):>20s}{dtag}  {child.task_spec[:50]}")
 
     click.echo()
     store.close()
@@ -494,36 +532,31 @@ def inspect(ctx: click.Context, node_id: str) -> None:
 def domains(ctx: click.Context, run_id: str) -> None:
     """Show the domain registry for a run."""
     config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
     config.ensure_dirs()
     store = StateStore(config.db_path)
 
     run_record = store.get_run(run_id)
     if run_record is None or run_record.root_node_id is None:
-        click.echo(f"  {_red('error')} Run {run_id} not found")
+        click.echo(f"{INDENT}{_red('error')} Run {run_id} not found")
         store.close()
         return
 
     domain_list = store.get_domains(run_record.root_node_id)
     if not domain_list:
-        click.echo(_dim("  No domains registered."))
+        click.echo(_dim(f"{INDENT}No domains."))
         store.close()
         return
 
     click.echo()
-    click.echo(f"  {_dim('run')}  {run_id}  {_dim('pass')} {run_record.pass_count}")
-    click.echo()
-
     for d in domain_list:
         child = store.get_node(d.child_node_id)
         state = child.state.value if child else "unknown"
-        click.echo(f"  {_magenta(d.domain_name)}")
-        click.echo(f"    {_dim('node')}   {d.child_node_id[:16]}  {_styled_state(state)}")
+        click.echo(f"{INDENT}{_magenta(d.domain_name)}")
+        click.echo(f"{INDENT}  {_dim('node')}   {d.child_node_id[:16]}  {_s(state)}")
         if d.file_patterns:
-            click.echo(f"    {_dim('files')}  {', '.join(d.file_patterns)}")
-        if d.module_scope:
-            click.echo(f"    {_dim('scope')}  {d.module_scope}")
+            click.echo(f"{INDENT}  {_dim('files')}  {', '.join(d.file_patterns)}")
         click.echo()
-
     store.close()
 
 
@@ -536,24 +569,32 @@ def _make_adapter(model: str = "claude-sonnet-4-6"):
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 
-def _wait_with_status(runner: BackgroundRunner, config: RuntimeConfig) -> None:
-    """Poll the background runner, showing a live status line."""
-    spinner = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
-    i = 0
-    while runner.busy:
-        frame = _cyan(spinner[i % len(spinner)])
-        status = runner.get_status_line()
-        sys.stderr.write(f"{CLEAR_LINE}  {frame} {_dim('working...')} {status}")
-        sys.stderr.flush()
-        i += 1
-        if runner.wait_done(timeout=0.4):
-            break
-    sys.stderr.write(CLEAR_LINE)
-    sys.stderr.flush()
+def _print_pass_summary(config: RuntimeConfig, run_id: str) -> None:
+    """Compact summary after a pass completes."""
+    store = StateStore(config.db_path)
+    run_record = store.get_run(run_id)
+    nodes = store.get_run_nodes(run_id)
+    store.close()
+
+    if not run_record:
+        return
+
+    completed = sum(1 for n in nodes if n.state == NodeState.COMPLETED)
+    failed = sum(1 for n in nodes if n.state == NodeState.FAILED)
+    status = run_record.status
+
+    click.echo()
+    click.echo(f"{INDENT}{_s(status)}  {_dim(f'{len(nodes)} nodes  {completed} done')}" +
+               (f"  {_red(f'{failed} failed')}" if failed else ""))
+    click.echo()
+
+    if status == "paused":
+        click.echo(f"{INDENT}{_dim('type your next instructions, or /tree to see the node tree')}")
+        click.echo()
 
 
 def _print_run_result(config: RuntimeConfig, run_id: str) -> None:
-    """Print a compact run summary after each pass."""
+    """Full run result (for non-chat commands)."""
     store = StateStore(config.db_path)
     tree_data = get_node_tree(store, run_id)
     run_record = store.get_run(run_id)
@@ -565,62 +606,46 @@ def _print_run_result(config: RuntimeConfig, run_id: str) -> None:
 
     click.echo(_hr())
     click.echo()
-    click.echo(f"  {_dim('run')}    {run_id}")
-    click.echo(f"  {_dim('status')} {_styled_state(status)}  {_dim('pass')} {pass_num}  {_dim('nodes')} {len(nodes)}")
+    click.echo(f"{INDENT}{_dim('run')}    {run_id}")
+    click.echo(f"{INDENT}{_dim('status')} {_s(status)}  {_dim('pass')} {pass_num}  {_dim('nodes')} {len(nodes)}")
 
     if tree_data:
         click.echo()
         _print_tree(tree_data[0])
-
     click.echo()
 
-    if status == "paused":
-        click.echo(f"  {_dim('Waiting for input. Type your next instructions or /help.')}")
-        click.echo()
 
-
-def _print_tree(node: dict, prefix: str = "  ", is_last: bool = True) -> None:
+def _print_tree(node: dict, prefix: str = INDENT, is_last: bool = True) -> None:
     connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
     state = node["state"]
-
-    indicator_map = {
-        "completed": _green("+"),
-        "failed": _red("x"),
-        "cancelled": _dim("-"),
-        "paused": _yellow("||"),
-    }
-    indicator = indicator_map.get(state, _cyan("~"))
-
-    domain_tag = f" {_magenta(node['domain'])}" if node.get("domain") else ""
-    node_short = node["node_id"][:12]
-    task_short = node["task_spec"][:55]
-
-    click.echo(f"{prefix}{connector}{indicator} {_dim(node_short)}{domain_tag} {task_short}")
+    icon = {"completed": _green("+"), "failed": _red("x"),
+            "cancelled": _dim("-"), "paused": _yellow("||")}.get(state, _cyan("~"))
+    dtag = f" {_magenta(node['domain'])}" if node.get("domain") else ""
+    click.echo(f"{prefix}{connector}{icon} {_dim(node['node_id'][:12])}{dtag} {node['task_spec'][:55]}")
 
     children = node.get("children", [])
     for i, child in enumerate(children):
-        extension = "   " if is_last else "\u2502  "
-        _print_tree(child, prefix + extension, i == len(children) - 1)
+        ext = "   " if is_last else "\u2502  "
+        _print_tree(child, prefix + ext, i == len(children) - 1)
 
 
 def _print_live_tree(config: RuntimeConfig, run_id: str) -> None:
-    """Print the tree from live DB state."""
     try:
         store = StateStore(config.db_path)
         tree_data = get_node_tree(store, run_id)
         nodes = store.get_run_nodes(run_id)
         store.close()
     except Exception:
-        click.echo(_dim("  (could not read state)"))
+        click.echo(_dim(f"{INDENT}(could not read state)"))
         return
 
     if not tree_data:
-        click.echo(_dim("  No nodes yet."))
+        click.echo(_dim(f"{INDENT}No nodes yet."))
         return
 
     active = sum(1 for n in nodes if not n.state.is_idle)
     done = sum(1 for n in nodes if n.state == NodeState.COMPLETED)
-    click.echo(f"  {_dim('nodes')} {len(nodes)}  {_green(str(done) + ' done')}  {_cyan(str(active) + ' active')}")
+    click.echo(f"{INDENT}{_dim('nodes')} {len(nodes)}  {_green(f'{done} done')}  {_cyan(f'{active} active')}")
     click.echo()
     _print_tree(tree_data[0])
     click.echo()
@@ -628,22 +653,18 @@ def _print_live_tree(config: RuntimeConfig, run_id: str) -> None:
 
 def _read_input() -> str:
     try:
-        return click.prompt(
-            f"  {BOLD}{CYAN}\u276f{RESET}",
-            prompt_suffix=" ",
-        ).strip()
+        return click.prompt(f"{INDENT}{BOLD}{CYAN}\u276f{RESET}", prompt_suffix=" ").strip()
     except (click.Abort, EOFError):
         return ""
 
 
 def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRunner) -> bool:
-    """Handle slash commands in the REPL. Returns True if should exit."""
     cmd = cmd.strip().lower()
     run_id = runner.run_id
 
     if cmd in ("/quit", "/exit", "/q"):
         if run_id:
-            click.echo(f"\n  {_dim('Run paused. Resume with:')} rari chat {run_id}")
+            click.echo(f"\n{INDENT}{_dim('run paused. resume with:')} rari chat {run_id}")
         click.echo()
         return True
 
@@ -653,8 +674,7 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
             store = StateStore(config.db_path)
             store.finish_run(run_id, "completed")
             store.close()
-        click.echo(f"\n  {_green('done')} Run finalized.")
-        click.echo()
+        click.echo(f"\n{INDENT}{_green('done')} run finalized.\n")
         return True
 
     if cmd in ("/tree", "/t"):
@@ -662,7 +682,7 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
         if run_id:
             _print_live_tree(config, run_id)
         else:
-            click.echo(_dim("  No active run."))
+            click.echo(_dim(f"{INDENT}no active run."))
         return False
 
     if cmd in ("/domains", "/d"):
@@ -670,19 +690,18 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
         if run_id:
             config.ensure_dirs()
             store = StateStore(config.db_path)
-            run_record = store.get_run(run_id)
-            if run_record and run_record.root_node_id:
-                domain_list = store.get_domains(run_record.root_node_id)
-                if domain_list:
-                    for d in domain_list:
-                        child = store.get_node(d.child_node_id)
-                        state = child.state.value if child else "?"
-                        click.echo(f"  {_magenta(d.domain_name)}  {_styled_state(state)}  {_dim(d.child_node_id[:12])}")
-                else:
-                    click.echo(_dim("  No domains."))
+            rr = store.get_run(run_id)
+            if rr and rr.root_node_id:
+                dl = store.get_domains(rr.root_node_id)
+                for d in dl:
+                    ch = store.get_node(d.child_node_id)
+                    st = ch.state.value if ch else "?"
+                    click.echo(f"{INDENT}{_magenta(d.domain_name)}  {_s(st)}  {_dim(d.child_node_id[:12])}")
+                if not dl:
+                    click.echo(_dim(f"{INDENT}no domains."))
             store.close()
         else:
-            click.echo(_dim("  No active run."))
+            click.echo(_dim(f"{INDENT}no active run."))
         click.echo()
         return False
 
@@ -691,31 +710,36 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
         if run_id:
             try:
                 store = StateStore(config.db_path)
-                run_record = store.get_run(run_id)
+                rr = store.get_run(run_id)
                 nodes = store.get_run_nodes(run_id)
                 store.close()
-                status = run_record.status if run_record else "unknown"
                 active = [n for n in nodes if not n.state.is_idle]
-                click.echo(f"  {_dim('run')}    {run_id}")
-                click.echo(f"  {_dim('status')} {_styled_state(status)}  {_dim('nodes')} {len(nodes)}  {_cyan(str(len(active)) + ' active')}")
+                click.echo(f"{INDENT}{_dim('run')}    {run_id}")
+                click.echo(f"{INDENT}{_dim('status')} {_s(rr.status)}  {_dim('nodes')} {len(nodes)}  {_cyan(f'{len(active)} active')}")
                 if runner.busy:
-                    click.echo(f"  {_cyan('working...')}")
+                    click.echo(f"{INDENT}{_cyan('working...')}")
             except Exception:
-                click.echo(_dim("  (could not read state)"))
+                click.echo(_dim(f"{INDENT}(could not read state)"))
         else:
-            click.echo(_dim("  No active run."))
+            click.echo(_dim(f"{INDENT}no active run."))
         click.echo()
+        return False
+
+    if cmd in ("/log", "/logs"):
+        log_path = config.ri_dir / "rari.log"
+        click.echo(f"\n{INDENT}{_dim('log:')} {log_path}\n")
         return False
 
     if cmd == "/help":
         click.echo()
-        click.echo(f"  {_bold('/tree')}     {_dim('Show the node tree (live)')}")
-        click.echo(f"  {_bold('/status')}   {_dim('Show run status')}")
-        click.echo(f"  {_bold('/domains')}  {_dim('Show domain registry')}")
-        click.echo(f"  {_bold('/done')}     {_dim('Finalize and close the run')}")
-        click.echo(f"  {_bold('/quit')}     {_dim('Exit (run stays paused)')}")
+        click.echo(f"{INDENT}{_bold('/tree')}     {_dim('show the node tree (live)')}")
+        click.echo(f"{INDENT}{_bold('/status')}   {_dim('show run status')}")
+        click.echo(f"{INDENT}{_bold('/domains')}  {_dim('show domain registry')}")
+        click.echo(f"{INDENT}{_bold('/log')}      {_dim('show log file path')}")
+        click.echo(f"{INDENT}{_bold('/done')}     {_dim('finalize and close the run')}")
+        click.echo(f"{INDENT}{_bold('/quit')}     {_dim('exit (run stays paused)')}")
         click.echo()
         return False
 
-    click.echo(f"  {_dim('Unknown command. Try /help')}")
+    click.echo(f"{INDENT}{_dim('unknown command. try /help')}")
     return False
