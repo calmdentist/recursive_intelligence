@@ -24,7 +24,7 @@ class MockAdapter(AgentAdapter):
     def name(self) -> str:
         return "mock"
 
-    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None):
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
         # Simulate making a change if requested
         if self._commit and mode == "execute":
             test_file = Path(worktree) / "output.txt"
@@ -152,7 +152,7 @@ class TestBaselineRunner:
 
     @pytest.mark.asyncio
     async def test_dirty_repo_fails(self, config, git_repo):
-        (git_repo / "dirty.txt").write_text("uncommitted")
+        (git_repo / "README.md").write_text("modified tracked file")
         adapter = MockAdapter()
         runner = BaselineRunner(config, adapter)
 

@@ -80,7 +80,8 @@ class TestRepoChecks:
         ensure_clean_repo(git_repo)  # should not raise
 
     def test_dirty_repo_raises(self, git_repo):
-        (git_repo / "dirty.txt").write_text("uncommitted")
+        # Modify a tracked file (untracked files are allowed)
+        (git_repo / "README.md").write_text("modified")
         with pytest.raises(WorktreeError, match="uncommitted"):
             ensure_clean_repo(git_repo)
 

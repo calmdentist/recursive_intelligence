@@ -11,13 +11,14 @@ The orchestrator never reasons about tasks. It only:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from recursive_intelligence.adapters.base import AgentAdapter
+from recursive_intelligence.adapters.base import AgentAdapter, StreamCallback
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.git.diffing import ArtifactBundle, build_artifact_bundle
 from recursive_intelligence.git.merge import cherry_pick_child, abort_cherry_pick
@@ -52,16 +53,24 @@ log = logging.getLogger(__name__)
 class Orchestrator:
     """Drives the recursive runtime."""
 
-    def __init__(self, config: RuntimeConfig, adapter: AgentAdapter) -> None:
+    def __init__(self, config: RuntimeConfig, adapter: AgentAdapter, on_message: StreamCallback = None) -> None:
         self.config = config
         self.adapter = adapter
         self.store: StateStore | None = None
+        self._on_message = on_message
+        self._root_node_id: str | None = None
 
     def _ensure_store(self) -> StateStore:
         if self.store is None:
             self.config.ensure_dirs()
             self.store = StateStore(self.config.db_path)
         return self.store
+
+    def _stream_callback_for(self, node_id: str) -> StreamCallback:
+        """Return the stream callback only if this is the root node."""
+        if node_id == self._root_node_id and self._on_message:
+            return self._on_message
+        return None
 
     # --- Run lifecycle ---
 
@@ -88,6 +97,7 @@ class Orchestrator:
             worktree_path=str(wt_path), branch_name=b_name,
         )
         store.set_root_node(run.run_id, root.node_id)
+        self._root_node_id = root.node_id
         log.info("Created root node %s at %s", root.node_id, wt_path)
 
         await self._drive_root(run.run_id, root.node_id, persistent)
@@ -111,7 +121,7 @@ class Orchestrator:
         if root is None or root.state != NodeState.PAUSED:
             raise ValueError(f"Root node is not paused (state={root.state.value if root else 'missing'})")
 
-        # Resume the root with the new input
+        self._root_node_id = root.node_id
         fsm = NodeFSM(store, root.node_id)
         fsm.resume_from_pause(user_input)
 
@@ -156,10 +166,13 @@ class Orchestrator:
             NodeState.WAITING_ON_CHILDREN, NodeState.REVIEWING_CHILDREN,
             NodeState.MERGING,
         ]
+        node_ids = []
         for state in resumable:
             nodes = store.get_nodes_in_state(run_id, state)
-            for node in nodes:
-                await self._drive_node(node.node_id)
+            node_ids.extend(n.node_id for n in nodes)
+
+        if node_ids:
+            await asyncio.gather(*[self._drive_node(nid) for nid in node_ids])
 
     # --- Node driving ---
 
@@ -216,6 +229,7 @@ class Orchestrator:
             result = await self.adapter.run(
                 prompt=prompt, worktree=worktree, mode="plan",
                 resume_session_id=node.session_id if is_routing else None,
+                on_message=self._stream_callback_for(node.node_id),
             )
         except Exception as e:
             log.error("Planning failed for %s: %s", node.node_id, e)
@@ -337,6 +351,7 @@ class Orchestrator:
             result = await self.adapter.run(
                 prompt=prompt, worktree=worktree, mode="execute",
                 resume_session_id=resume_id,
+                on_message=self._stream_callback_for(node.node_id),
             )
         except Exception as e:
             log.error("Execution failed for %s: %s", node.node_id, e)
@@ -376,8 +391,11 @@ class Orchestrator:
             fsm.fail("No children found", failure_type="orchestrator_error")
             return
 
+        # Phase 1: Prepare all children serially.
+        # Worktree creation and state transitions must be serial because
+        # `git worktree add` modifies the shared .git directory.
+        children_to_drive: list[str] = []
         for child in children:
-            # Check for pending revision
             if child.state == NodeState.COMPLETED and self._has_pending_work(child):
                 log.info("Child %s has pending work, re-executing", child.node_id)
                 store.transition_node(child.node_id, NodeState.EXECUTING, {
@@ -391,7 +409,6 @@ class Orchestrator:
             elif child.state.is_idle:
                 continue
 
-            # Create worktree for child if needed
             if not child.worktree_path:
                 parent_node = fsm.node
                 parent_wt = Path(parent_node.worktree_path) if parent_node.worktree_path else self.config.repo_root
@@ -403,13 +420,43 @@ class Orchestrator:
                 )
                 store.update_node(child.node_id, worktree_path=str(wt_path), branch_name=b_name)
 
-            try:
-                await self._drive_node(child.node_id)
-            except Exception as e:
-                log.error("Child %s failed: %s", child.node_id, e)
-                child_fsm = NodeFSM(store, child.node_id)
-                if not child_fsm.node.state.is_idle:
-                    child_fsm.fail(str(e), failure_type="orchestrator_error")
+            children_to_drive.append(child.node_id)
+
+        # Phase 2: Drive all prepared children in parallel.
+        # Each child has its own worktree and session — fully isolated.
+        # Nested parallelism is automatic: if a child spawns grandchildren,
+        # this same method will gather *those* in parallel too.
+        if children_to_drive:
+            sem = (
+                asyncio.Semaphore(self.config.max_parallel_children)
+                if self.config.max_parallel_children > 0
+                else None
+            )
+
+            async def _drive_child_safe(child_node_id: str) -> None:
+                async def _inner():
+                    try:
+                        await self._drive_node(child_node_id)
+                    except Exception as e:
+                        log.error("Child %s failed: %s", child_node_id, e)
+                        child_fsm = NodeFSM(store, child_node_id)
+                        if not child_fsm.node.state.is_idle:
+                            child_fsm.fail(str(e), failure_type="orchestrator_error")
+
+                if sem:
+                    async with sem:
+                        await _inner()
+                else:
+                    await _inner()
+
+            log.info(
+                "Driving %d children in parallel (max_parallel=%s)",
+                len(children_to_drive),
+                self.config.max_parallel_children or "unlimited",
+            )
+            await asyncio.gather(*[
+                _drive_child_safe(cid) for cid in children_to_drive
+            ])
 
         fsm.wake_for_review()
 
@@ -523,7 +570,8 @@ class Orchestrator:
                 result = await self.adapter.run(
                     prompt=prompt, worktree=parent_wt, mode="review",
                     resume_session_id=node.session_id,
-                    )
+                    on_message=self._stream_callback_for(node.node_id),
+                )
             except Exception as e:
                 log.error("Review failed for %s: %s", child.node_id, e)
                 verdict = ReviewVerdict(

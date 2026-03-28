@@ -12,6 +12,7 @@ class RuntimeConfig:
     """Configuration for a recursive intelligence run."""
 
     repo_root: Path
+    max_parallel_children: int = 5  # 0 = unlimited
     ri_dir: Path = field(init=False)
     db_path: Path = field(init=False)
     worktrees_dir: Path = field(init=False)
