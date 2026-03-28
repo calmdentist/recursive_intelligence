@@ -8,14 +8,15 @@ from pathlib import Path
 import pytest
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult
-from recursive_intelligence.benchmarks.models import BenchmarkModeResult, PatchScore, SWEBenchTask, TaskBenchmarkResult
-from recursive_intelligence.benchmarks.reporting import build_suite_report, export_report
-from recursive_intelligence.benchmarks.runner import (
-    BenchmarkRunner,
+from recursive_intelligence.benchmarks.evaluation import (
+    LocalPatchEvaluator,
+    OfficialHarnessEvaluator,
     _run_test_command,
     _select_task_python,
-    compare_modes,
 )
+from recursive_intelligence.benchmarks.models import BenchmarkModeResult, PatchScore, SWEBenchTask, TaskBenchmarkResult
+from recursive_intelligence.benchmarks.reporting import build_suite_report, export_report
+from recursive_intelligence.benchmarks.runner import BenchmarkRunner, compare_modes
 from recursive_intelligence.config import RuntimeConfig
 
 
@@ -138,7 +139,11 @@ async def test_benchmark_runner_persists_reports_and_exports(tmp_path: Path, sou
             return BaselineFixAdapter()
         return RecursiveFixAdapter()
 
-    runner = BenchmarkRunner(config, adapter_factory=adapter_factory)
+    runner = BenchmarkRunner(
+        config,
+        adapter_factory=adapter_factory,
+        patch_evaluator=LocalPatchEvaluator(),
+    )
     report = await runner.run_swebench_suite([task], suite="tier-a", dataset="local", split="test")
 
     assert report.task_count == 1
@@ -197,7 +202,7 @@ def test_select_task_python_marks_unsupported_when_required_interpreter_missing(
     )
 
     monkeypatch.setattr(
-        "recursive_intelligence.benchmarks.runner._available_python_interpreters",
+        "recursive_intelligence.benchmarks.evaluation._available_python_interpreters",
         lambda: (("/usr/bin/python3.13", (3, 13, 1)),),
     )
 
@@ -207,6 +212,52 @@ def test_select_task_python_marks_unsupported_when_required_interpreter_missing(
     assert selection["python_executable"] is None
     assert "Python <=3.9" in selection["requirement"]
     assert "python3.13" in selection["error"]
+
+
+def test_official_harness_evaluator_reads_instance_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = SWEBenchTask(
+        instance_id="sympy__sympy-13091",
+        repo="sympy/sympy",
+        base_commit="abc123",
+        problem_statement="fix it",
+        patch="",
+        test_patch="",
+        version="1.1",
+        fail_to_pass=[],
+        pass_to_pass=[],
+    )
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "swebench" else None)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/docker" if name == "docker" else f"/usr/bin/{name}")
+
+    def _fake_run(command, cwd=None, capture_output=False, text=False, **kwargs):
+        eval_dir = Path(command[command.index("--report_dir") + 1])
+        run_id = command[command.index("--run_id") + 1]
+        instance_dir = eval_dir / "logs" / "run_evaluation" / run_id / "recursive-intelligence__baseline" / task.instance_id
+        instance_dir.mkdir(parents=True, exist_ok=True)
+        (instance_dir / "report.json").write_text(f'{{"{task.instance_id}": {{"resolved": true}}}}')
+        (instance_dir / "test_output.txt").write_text("tests passed")
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    evaluator = OfficialHarnessEvaluator(
+        dataset_name="SWE-bench/SWE-bench_Verified",
+        split="test",
+        python_executable="python3",
+    )
+    score = evaluator.score_patch(task, "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n", task_dir, "baseline")
+
+    assert score.status == "passed"
+    assert score.patch_applied is True
+    assert score.tests_passed is True
+    assert score.report_path is not None
+    assert score.log_path is not None
 
 
 def test_report_excludes_unsupported_tasks_from_solve_rate():

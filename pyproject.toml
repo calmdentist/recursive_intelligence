@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
     "claude-agent-sdk",
+    "swebench>=4.1.0",
     "textual>=0.79",
 ]
 
