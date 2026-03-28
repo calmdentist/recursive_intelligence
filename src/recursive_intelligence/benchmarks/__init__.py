@@ -1,5 +1,10 @@
 """Benchmark harness exports."""
 
+from recursive_intelligence.benchmarks.evaluation import (
+    LocalPatchEvaluator,
+    OfficialHarnessEvaluator,
+    PatchEvaluator,
+)
 from recursive_intelligence.benchmarks.models import (
     BenchmarkModeResult,
     BenchmarkSuiteReport,
@@ -25,7 +30,10 @@ __all__ = [
     "DEFAULT_DATASET",
     "DEFAULT_SPLIT",
     "DEFAULT_SUITE",
+    "LocalPatchEvaluator",
+    "OfficialHarnessEvaluator",
     "PatchScore",
+    "PatchEvaluator",
     "SWEBenchLoader",
     "SWEBenchTask",
     "TaskBenchmarkResult",

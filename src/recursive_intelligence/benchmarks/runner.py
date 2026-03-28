@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import shlex
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord
+from recursive_intelligence.benchmarks.evaluation import OfficialHarnessEvaluator, PatchEvaluator
 from recursive_intelligence.benchmarks.models import (
     BenchmarkModeResult,
     PatchScore,
@@ -23,12 +20,7 @@ from recursive_intelligence.benchmarks.models import (
     TaskBenchmarkResult,
 )
 from recursive_intelligence.benchmarks.reporting import build_suite_report
-from recursive_intelligence.benchmarks.swebench import (
-    DEFAULT_DATASET,
-    DEFAULT_SPLIT,
-    resolve_test_command,
-    resolve_python_requirement,
-)
+from recursive_intelligence.benchmarks.swebench import DEFAULT_DATASET, DEFAULT_SPLIT
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.runtime.baseline import BaselineRunner
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
@@ -46,16 +38,20 @@ class BenchmarkRunner:
         config: RuntimeConfig,
         model: str = "claude-opus-4-6",
         adapter_factory: AdapterFactory | None = None,
+        patch_evaluator: PatchEvaluator | None = None,
         keep_task_dirs: bool = False,
         cleanup_task_dirs: bool = True,
         test_timeout_seconds: int = 1800,
+        evaluation_namespace: str | None = None,
     ) -> None:
         self.config = config
         self.model = model
         self.adapter_factory = adapter_factory
+        self.patch_evaluator = patch_evaluator
         self.keep_task_dirs = keep_task_dirs
         self.cleanup_task_dirs = cleanup_task_dirs
         self.test_timeout_seconds = test_timeout_seconds
+        self.evaluation_namespace = evaluation_namespace
 
     async def run_swebench_suite(
         self,
@@ -69,10 +65,16 @@ class BenchmarkRunner:
         run_dir = self.config.benchmarks_dir / run_id
         tasks_dir = run_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
+        evaluator = self.patch_evaluator or OfficialHarnessEvaluator(
+            dataset_name=dataset,
+            split=split,
+            timeout_seconds=self.test_timeout_seconds,
+            namespace=self.evaluation_namespace,
+        )
 
         results: list[TaskBenchmarkResult] = []
         for task in tasks:
-            result = await self.run_task(run_id, task)
+            result = await self.run_task(run_id, task, evaluator)
             results.append(result)
             task_path = tasks_dir / f"{task.instance_id}.json"
             task_path.write_text(json.dumps(result.to_dict(), indent=2))
@@ -81,12 +83,17 @@ class BenchmarkRunner:
 
         return build_suite_report(run_id, "swebench", suite, dataset, split, results)
 
-    async def run_task(self, benchmark_run_id: str, task: SWEBenchTask) -> TaskBenchmarkResult:
+    async def run_task(
+        self,
+        benchmark_run_id: str,
+        task: SWEBenchTask,
+        evaluator: PatchEvaluator,
+    ) -> TaskBenchmarkResult:
         task_dir = self.config.benchmarks_dir / benchmark_run_id / "artifacts" / task.instance_id
         task_dir.mkdir(parents=True, exist_ok=True)
 
-        baseline = await self._run_mode(task, task_dir, mode="baseline")
-        recursive = await self._run_mode(task, task_dir, mode="recursive")
+        baseline = await self._run_mode(task, task_dir, mode="baseline", evaluator=evaluator)
+        recursive = await self._run_mode(task, task_dir, mode="recursive", evaluator=evaluator)
         comparison = compare_modes(baseline, recursive)
 
         result = TaskBenchmarkResult(
@@ -101,7 +108,13 @@ class BenchmarkRunner:
         (task_dir / "task.json").write_text(json.dumps(result.to_dict(), indent=2))
         return result
 
-    async def _run_mode(self, task: SWEBenchTask, task_dir: Path, mode: str) -> BenchmarkModeResult:
+    async def _run_mode(
+        self,
+        task: SWEBenchTask,
+        task_dir: Path,
+        mode: str,
+        evaluator: PatchEvaluator,
+    ) -> BenchmarkModeResult:
         scratch_dir = Path(tempfile.mkdtemp(prefix=f"rari-{task.instance_id}-{mode}-"))
         repo_dir = scratch_dir / "repo"
         patch_path = task_dir / f"{mode}.patch"
@@ -121,7 +134,7 @@ class BenchmarkRunner:
                 patch_text = _git_diff(repo_dir, task.base_commit, worktree=str(baseline_worktree))
                 patch_path.write_text(patch_text)
                 _copy_ri_artifacts(repo_dir, ri_artifacts_dir)
-                score = self._score_patch(task, patch_text, task_dir, mode)
+                score = self._score_patch(task, patch_text, task_dir, mode, evaluator)
                 return BenchmarkModeResult(
                     mode=mode,
                     run_id=report.run_id,
@@ -148,7 +161,7 @@ class BenchmarkRunner:
             patch_text = _git_diff(repo_dir, task.base_commit, worktree=summary["root_worktree"])
             patch_path.write_text(patch_text)
             _copy_ri_artifacts(repo_dir, ri_artifacts_dir)
-            score = self._score_patch(task, patch_text, task_dir, mode)
+            score = self._score_patch(task, patch_text, task_dir, mode, evaluator)
             return BenchmarkModeResult(
                 mode=mode,
                 run_id=run_id,
@@ -199,111 +212,15 @@ class BenchmarkRunner:
             if self.cleanup_task_dirs and not self.keep_task_dirs:
                 shutil.rmtree(scratch_dir, ignore_errors=True)
 
-    def _score_patch(self, task: SWEBenchTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
-        if not patch_text.strip():
-            return PatchScore(
-                status="no_patch",
-                patch_applied=False,
-                tests_passed=False,
-                exit_code=None,
-                test_command=resolve_test_command(task),
-                error="Solver produced an empty patch",
-            )
-
-        scratch_dir = Path(tempfile.mkdtemp(prefix=f"rari-score-{task.instance_id}-{mode}-"))
-        repo_dir = scratch_dir / "repo"
-        log_path = task_dir / f"{mode}-score.log"
-        patch_file = scratch_dir / "candidate.patch"
-
-        try:
-            _clone_repo(task.repo, task.base_commit, repo_dir)
-            patch_file.write_text(patch_text)
-            apply_check = subprocess.run(
-                ["git", "apply", "--check", str(patch_file)],
-                cwd=str(repo_dir),
-                capture_output=True,
-                text=True,
-            )
-            if apply_check.returncode != 0:
-                log_path.write_text(apply_check.stderr or apply_check.stdout)
-                return PatchScore(
-                    status="patch_failed",
-                    patch_applied=False,
-                    tests_passed=False,
-                    exit_code=apply_check.returncode,
-                    test_command=resolve_test_command(task),
-                    log_path=str(log_path),
-                    error=(apply_check.stderr or apply_check.stdout).strip(),
-                )
-
-            apply_patch = subprocess.run(
-                ["git", "apply", str(patch_file)],
-                cwd=str(repo_dir),
-                capture_output=True,
-                text=True,
-            )
-            if apply_patch.returncode != 0:
-                log_path.write_text(apply_patch.stderr or apply_patch.stdout)
-                return PatchScore(
-                    status="patch_failed",
-                    patch_applied=False,
-                    tests_passed=False,
-                    exit_code=apply_patch.returncode,
-                    test_command=resolve_test_command(task),
-                    log_path=str(log_path),
-                    error=(apply_patch.stderr or apply_patch.stdout).strip(),
-                )
-
-            command = resolve_test_command(task)
-            python_selection = _select_task_python(task)
-            if python_selection["status"] == "unsupported":
-                message = python_selection["error"]
-                log_path.write_text(message)
-                return PatchScore(
-                    status="unsupported_environment",
-                    patch_applied=True,
-                    tests_passed=False,
-                    exit_code=None,
-                    test_command=command,
-                    log_path=str(log_path),
-                    error=message,
-                    python_requirement=python_selection["requirement"],
-                )
-
-            completed = _run_test_command(
-                command,
-                repo_dir,
-                self.test_timeout_seconds,
-                python_executable=python_selection["python_executable"],
-            )
-            log_path.write_text((completed.stdout or "") + "\n" + (completed.stderr or ""))
-            passed = completed.returncode == 0
-            return PatchScore(
-                status="passed" if passed else "failed",
-                patch_applied=True,
-                tests_passed=passed,
-                exit_code=completed.returncode,
-                test_command=command,
-                log_path=str(log_path),
-                python_executable=python_selection["python_executable"],
-                python_requirement=python_selection["requirement"],
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "") + "\n" + (exc.stderr or "")
-            log_path.write_text(output)
-            return PatchScore(
-                status="timeout",
-                patch_applied=True,
-                tests_passed=False,
-                exit_code=None,
-                test_command=resolve_test_command(task),
-                log_path=str(log_path),
-                error="Test command timed out",
-                python_requirement=_describe_python_requirement(task),
-            )
-        finally:
-            if self.cleanup_task_dirs and not self.keep_task_dirs:
-                shutil.rmtree(scratch_dir, ignore_errors=True)
+    def _score_patch(
+        self,
+        task: SWEBenchTask,
+        patch_text: str,
+        task_dir: Path,
+        mode: str,
+        evaluator: PatchEvaluator,
+    ) -> PatchScore:
+        return evaluator.score_patch(task, patch_text, task_dir, mode)
 
     def _make_adapter(self, mode: str, task: SWEBenchTask) -> AgentAdapter:
         if self.adapter_factory is not None:
@@ -374,187 +291,8 @@ def _git_changed_files(worktree: str, base_commit: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def _run_test_command(
-    command: str,
-    repo_dir: Path,
-    timeout_seconds: int,
-    python_executable: str | None = None,
-) -> subprocess.CompletedProcess[str]:
-    tokens = shlex.split(command)
-    env = os.environ.copy()
-
-    idx = 0
-    while idx < len(tokens) and _is_env_assignment(tokens[idx]):
-        key, _, value = tokens[idx].partition("=")
-        env[key] = value
-        idx += 1
-
-    argv = tokens[idx:]
-    if not argv:
-        raise ValueError(f"Malformed test command: {command}")
-
-    argv = _normalize_python_runner(argv, repo_dir, python_executable)
-    return subprocess.run(
-        argv,
-        cwd=str(repo_dir),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
-
-
-def _normalize_python_runner(
-    argv: list[str],
-    repo_dir: Path,
-    python_executable: str | None = None,
-) -> list[str]:
-    executable = argv[0]
-    executable_name = Path(executable).name
-    script_path = (repo_dir / executable).resolve() if not Path(executable).is_absolute() else Path(executable)
-    python_missing = shutil.which("python") is None
-    fallback_python = python_executable or shutil.which("python3")
-
-    if python_executable and executable_name.startswith("python"):
-        return [python_executable, *argv[1:]]
-
-    if python_executable and executable in {"pytest", "py.test"}:
-        return [python_executable, "-m", "pytest", *argv[1:]]
-
-    if (
-        python_missing
-        and fallback_python
-        and script_path.exists()
-        and script_path.is_file()
-        and _uses_env_python(script_path)
-    ):
-        return [fallback_python, str(script_path), *argv[1:]]
-
-    if (
-        python_executable
-        and script_path.exists()
-        and script_path.is_file()
-        and _uses_python_shebang(script_path)
-    ):
-        return [python_executable, str(script_path), *argv[1:]]
-
-    return argv
-
-
-def _uses_env_python(script_path: Path) -> bool:
-    try:
-        first_line = script_path.read_text(errors="ignore").splitlines()[0]
-    except IndexError:
-        return False
-    return first_line.startswith("#!") and "env python" in first_line
-
-
-def _uses_python_shebang(script_path: Path) -> bool:
-    try:
-        first_line = script_path.read_text(errors="ignore").splitlines()[0]
-    except IndexError:
-        return False
-    return first_line.startswith("#!") and "python" in first_line
-
-
-def _is_env_assignment(token: str) -> bool:
-    if "=" not in token:
-        return False
-    name, _, _ = token.partition("=")
-    return bool(name) and (name[0].isalpha() or name[0] == "_") and all(
-        ch.isalnum() or ch == "_" for ch in name
-    )
-
-
 def _is_unsupported_score(score: PatchScore) -> bool:
     return score.status == "unsupported_environment"
-
-
-def _describe_python_requirement(task: SWEBenchTask) -> str | None:
-    requirement = resolve_python_requirement(task)
-    if requirement is None:
-        return None
-    return requirement.describe()
-
-
-def _select_task_python(task: SWEBenchTask) -> dict[str, str | None]:
-    requirement = resolve_python_requirement(task)
-    if requirement is None:
-        return {
-            "status": "supported",
-            "python_executable": None,
-            "requirement": None,
-            "error": None,
-        }
-
-    for executable, version in _available_python_interpreters():
-        if requirement.matches(version):
-            return {
-                "status": "supported",
-                "python_executable": executable,
-                "requirement": requirement.describe(),
-                "error": None,
-            }
-
-    available = ", ".join(
-        f"{Path(executable).name} ({version[0]}.{version[1]}.{version[2]})"
-        for executable, version in _available_python_interpreters()
-    ) or "none"
-    return {
-        "status": "unsupported",
-        "python_executable": None,
-        "requirement": requirement.describe(),
-        "error": (
-            f"Unsupported benchmark environment: requires {requirement.describe()}, "
-            f"but available interpreters are {available}."
-        ),
-    }
-
-
-@lru_cache(maxsize=1)
-def _available_python_interpreters() -> tuple[tuple[str, tuple[int, int, int]], ...]:
-    names = [
-        Path(sys.executable).name,
-        "python",
-        "python3",
-        "python3.13",
-        "python3.12",
-        "python3.11",
-        "python3.10",
-        "python3.9",
-        "python3.8",
-    ]
-    interpreters: list[tuple[str, tuple[int, int, int]]] = []
-    seen: set[str] = set()
-    for name in names:
-        path = shutil.which(name)
-        if path is None or path in seen:
-            continue
-        version = _python_version(path)
-        if version is None:
-            continue
-        interpreters.append((path, version))
-        seen.add(path)
-    return tuple(interpreters)
-
-
-def _python_version(executable: str) -> tuple[int, int, int] | None:
-    result = subprocess.run(
-        [
-            executable,
-            "-c",
-            "import sys; print('.'.join(str(part) for part in sys.version_info[:3]))",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return None
-    raw = result.stdout.strip()
-    parts = raw.split(".")
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        return None
-    return int(parts[0]), int(parts[1]), int(parts[2])
 
 
 def _summarize_recursive_run(config: RuntimeConfig, run_id: str, base_commit: str) -> dict:

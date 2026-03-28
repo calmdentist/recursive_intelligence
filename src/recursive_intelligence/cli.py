@@ -368,6 +368,11 @@ def benchmark(ctx: click.Context) -> None:
 @click.option("--refresh", is_flag=True, help="Refresh the cached dataset")
 @click.option("--keep-task-dirs", is_flag=True, help="Keep cloned task directories after the run")
 @click.option("--model", default="claude-opus-4-6", help="Model to use")
+@click.option(
+    "--namespace",
+    default=None,
+    help="Docker image namespace override for the official SWE-bench harness",
+)
 @click.pass_context
 def benchmark_swebench(
     ctx: click.Context,
@@ -378,6 +383,7 @@ def benchmark_swebench(
     refresh: bool,
     keep_task_dirs: bool,
     model: str,
+    namespace: str | None,
 ) -> None:
     """Benchmark recursive intelligence on SWE-bench."""
     from recursive_intelligence.benchmarks import BenchmarkRunner, SWEBenchLoader
@@ -390,7 +396,12 @@ def benchmark_swebench(
         if limit is not None:
             tasks = tasks[:limit]
 
-        runner = BenchmarkRunner(config, model=model, keep_task_dirs=keep_task_dirs)
+        runner = BenchmarkRunner(
+            config,
+            model=model,
+            keep_task_dirs=keep_task_dirs,
+            evaluation_namespace=namespace,
+        )
         report = asyncio.run(runner.run_swebench_suite(tasks, suite=suite, dataset=dataset, split=split))
 
         click.echo(f"{INDENT}{_dim('benchmark')} {report.run_id}")

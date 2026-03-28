@@ -60,6 +60,7 @@ class PatchScore:
     exit_code: int | None
     test_command: str
     log_path: str | None = None
+    report_path: str | None = None
     error: str | None = None
     python_executable: str | None = None
     python_requirement: str | None = None
