@@ -345,6 +345,85 @@ def baseline(ctx: click.Context, task: str, model: str) -> None:
         sys.exit(1)
 
 
+@main.group()
+@click.pass_context
+def benchmark(ctx: click.Context) -> None:
+    """Run benchmark suites."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+
+
+@benchmark.command("swebench")
+@click.option("--suite", default="tier-a", help="Suite to run")
+@click.option("--dataset", default="SWE-bench/SWE-bench_Verified", help="Dataset name")
+@click.option("--split", default="test", help="Dataset split")
+@click.option("--limit", type=int, default=None, help="Optional task limit")
+@click.option("--refresh", is_flag=True, help="Refresh the cached dataset")
+@click.option("--keep-task-dirs", is_flag=True, help="Keep cloned task directories after the run")
+@click.option("--model", default="claude-opus-4-6", help="Model to use")
+@click.pass_context
+def benchmark_swebench(
+    ctx: click.Context,
+    suite: str,
+    dataset: str,
+    split: str,
+    limit: int | None,
+    refresh: bool,
+    keep_task_dirs: bool,
+    model: str,
+) -> None:
+    """Benchmark recursive intelligence on SWE-bench."""
+    from recursive_intelligence.benchmarks import BenchmarkRunner, SWEBenchLoader
+
+    config: RuntimeConfig = ctx.obj["config"]
+    loader = SWEBenchLoader(config.datasets_dir, dataset=dataset, split=split)
+
+    try:
+        tasks = loader.load_suite(suite, refresh=refresh)
+        if limit is not None:
+            tasks = tasks[:limit]
+
+        runner = BenchmarkRunner(config, model=model, keep_task_dirs=keep_task_dirs)
+        report = asyncio.run(runner.run_swebench_suite(tasks, suite=suite, dataset=dataset, split=split))
+
+        click.echo(f"{INDENT}{_dim('benchmark')} {report.run_id}")
+        click.echo(f"{INDENT}{_dim('tasks')}      {report.task_count}")
+        click.echo(f"{INDENT}{_dim('baseline')}   {report.baseline.solved}/{report.baseline.total} solved")
+        click.echo(f"{INDENT}{_dim('recursive')}  {report.recursive.solved}/{report.recursive.total} solved")
+        click.echo(f"{INDENT}{_dim('report')}     {config.benchmarks_dir / report.run_id / 'report.json'}")
+    except Exception as e:
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
+        sys.exit(1)
+
+
+@main.command("export-report")
+@click.argument("run_id")
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help="Destination directory for exported files",
+)
+@click.pass_context
+def export_benchmark_report(ctx: click.Context, run_id: str, output_dir: Path | None) -> None:
+    """Export a benchmark report as JSON and CSV."""
+    from recursive_intelligence.benchmarks import export_report
+
+    config: RuntimeConfig = ctx.obj["config"]
+    report_path = config.benchmarks_dir / run_id / "report.json"
+    if not report_path.exists():
+        click.echo(f"{INDENT}{_red('error')} Benchmark report {run_id} not found", err=True)
+        sys.exit(1)
+
+    try:
+        paths = export_report(report_path, output_dir)
+        for path in paths:
+            click.echo(f"{INDENT}{_dim('exported')} {path}")
+    except Exception as e:
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
+        sys.exit(1)
+
+
 @main.command(name="continue")
 @click.argument("run_id")
 @click.argument("task")
