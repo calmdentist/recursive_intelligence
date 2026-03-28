@@ -1,7 +1,11 @@
 """Tests for SWE-bench loading and suite selection."""
 
 from recursive_intelligence.benchmarks.models import SWEBenchTask
-from recursive_intelligence.benchmarks.swebench import resolve_test_command, select_tier_a
+from recursive_intelligence.benchmarks.swebench import (
+    resolve_python_requirement,
+    resolve_test_command,
+    select_tier_a,
+)
 
 
 def _task(
@@ -78,3 +82,20 @@ def test_resolve_test_command_prefers_explicit_override():
     )
 
     assert resolve_test_command(task) == "python3 -m pytest tests/test_app.py"
+
+
+def test_resolve_python_requirement_for_legacy_sympy():
+    task = _task(
+        "sympy-1",
+        "sympy/sympy",
+        patch_files=2,
+        test_files=1,
+        score=10,
+        version="1.1",
+    )
+
+    requirement = resolve_python_requirement(task)
+
+    assert requirement is not None
+    assert requirement.maximum == (3, 9)
+    assert "collections.Mapping" in requirement.reason

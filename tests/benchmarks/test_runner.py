@@ -8,9 +8,14 @@ from pathlib import Path
 import pytest
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult
-from recursive_intelligence.benchmarks.models import SWEBenchTask
-from recursive_intelligence.benchmarks.reporting import export_report
-from recursive_intelligence.benchmarks.runner import BenchmarkRunner
+from recursive_intelligence.benchmarks.models import BenchmarkModeResult, PatchScore, SWEBenchTask, TaskBenchmarkResult
+from recursive_intelligence.benchmarks.reporting import build_suite_report, export_report
+from recursive_intelligence.benchmarks.runner import (
+    BenchmarkRunner,
+    _run_test_command,
+    _select_task_python,
+    compare_modes,
+)
 from recursive_intelligence.config import RuntimeConfig
 
 
@@ -154,3 +159,152 @@ async def test_benchmark_runner_persists_reports_and_exports(tmp_path: Path, sou
     exported = export_report(run_dir / "report.json", tmp_path / "exports")
     assert len(exported) == 2
     assert all(path.exists() for path in exported)
+
+
+def test_run_test_command_uses_python3_for_env_python_scripts(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bin_dir = repo / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "test"
+    script.write_text(
+        "#!/usr/bin/env python\n"
+        "import os, sys\n"
+        "print(sys.executable)\n"
+        "print(os.environ['BENCH_FLAG'])\n"
+    )
+    script.chmod(0o755)
+
+    completed = _run_test_command("BENCH_FLAG=ok bin/test", repo, timeout_seconds=10)
+
+    assert completed.returncode == 0
+    lines = completed.stdout.strip().splitlines()
+    assert Path(lines[0]).name.startswith("python3")
+    assert lines[1] == "ok"
+
+
+def test_select_task_python_marks_unsupported_when_required_interpreter_missing(monkeypatch: pytest.MonkeyPatch):
+    task = SWEBenchTask(
+        instance_id="sympy__sympy-13091",
+        repo="sympy/sympy",
+        base_commit="abc123",
+        problem_statement="fix it",
+        patch="",
+        test_patch="",
+        version="1.1",
+        fail_to_pass=[],
+        pass_to_pass=[],
+    )
+
+    monkeypatch.setattr(
+        "recursive_intelligence.benchmarks.runner._available_python_interpreters",
+        lambda: (("/usr/bin/python3.13", (3, 13, 1)),),
+    )
+
+    selection = _select_task_python(task)
+
+    assert selection["status"] == "unsupported"
+    assert selection["python_executable"] is None
+    assert "Python <=3.9" in selection["requirement"]
+    assert "python3.13" in selection["error"]
+
+
+def test_report_excludes_unsupported_tasks_from_solve_rate():
+    unsupported_score = PatchScore(
+        status="unsupported_environment",
+        patch_applied=True,
+        tests_passed=False,
+        exit_code=None,
+        test_command="bin/test",
+        error="requires Python <=3.9",
+        python_requirement="Python <=3.9",
+    )
+    unsupported_mode = BenchmarkModeResult(
+        mode="baseline",
+        run_id="run-1",
+        runtime_status="completed",
+        solved=False,
+        changed_files=[],
+        cost=CostRecord(),
+        duration_ms=100,
+        session_ids=["session-1"],
+        session_count=1,
+        node_count=1,
+        tree_depth=0,
+        tree_breadth=0,
+        patch_path=None,
+        patch_bytes=0,
+        ri_artifacts_path=None,
+        score=unsupported_score,
+    )
+    solved_mode = BenchmarkModeResult(
+        mode="recursive",
+        run_id="run-2",
+        runtime_status="completed",
+        solved=True,
+        changed_files=["app.py"],
+        cost=CostRecord(total_usd=1.0),
+        duration_ms=200,
+        session_ids=["session-2"],
+        session_count=1,
+        node_count=1,
+        tree_depth=0,
+        tree_breadth=0,
+        patch_path=None,
+        patch_bytes=10,
+        ri_artifacts_path=None,
+        score=PatchScore(
+            status="passed",
+            patch_applied=True,
+            tests_passed=True,
+            exit_code=0,
+            test_command="pytest",
+        ),
+    )
+
+    task = TaskBenchmarkResult(
+        instance_id="task-1",
+        repo="sympy/sympy",
+        version="1.1",
+        complexity_score=10,
+        baseline=unsupported_mode,
+        recursive=unsupported_mode,
+        comparison=compare_modes(unsupported_mode, unsupported_mode),
+    )
+    report = build_suite_report(
+        run_id="bench-1",
+        benchmark="swebench",
+        suite="tier-a",
+        dataset="local",
+        split="test",
+        tasks=[task],
+    )
+
+    assert report.baseline.total == 1
+    assert report.baseline.eligible == 0
+    assert report.baseline.unsupported == 1
+    assert report.baseline.solve_rate == 0.0
+    assert report.comparison.unsupported == 1
+
+    supported_task = TaskBenchmarkResult(
+        instance_id="task-2",
+        repo="local/repo",
+        version="local",
+        complexity_score=5,
+        baseline=solved_mode,
+        recursive=solved_mode,
+        comparison=compare_modes(solved_mode, solved_mode),
+    )
+    mixed_report = build_suite_report(
+        run_id="bench-2",
+        benchmark="swebench",
+        suite="tier-a",
+        dataset="local",
+        split="test",
+        tasks=[task, supported_task],
+    )
+
+    assert mixed_report.baseline.total == 2
+    assert mixed_report.baseline.eligible == 1
+    assert mixed_report.baseline.unsupported == 1
+    assert mixed_report.baseline.solve_rate == 1.0

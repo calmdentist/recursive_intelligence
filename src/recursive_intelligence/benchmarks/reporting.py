@@ -54,6 +54,8 @@ def export_report(report_path: Path, output_dir: Path | None = None) -> list[Pat
 def _build_mode_aggregate(tasks: list[TaskBenchmarkResult], mode: str) -> ModeAggregate:
     mode_results = [getattr(task, mode) for task in tasks]
     total = len(mode_results)
+    unsupported = sum(1 for result in mode_results if result.score.status == "unsupported_environment")
+    eligible = total - unsupported
     solved = sum(1 for result in mode_results if result.solved)
     latencies = [result.duration_ms for result in mode_results]
     costs = [result.cost.total_usd for result in mode_results]
@@ -61,9 +63,11 @@ def _build_mode_aggregate(tasks: list[TaskBenchmarkResult], mode: str) -> ModeAg
     breadths = [result.tree_breadth for result in mode_results]
     nodes = [result.node_count for result in mode_results]
     return ModeAggregate(
-        solve_rate=(solved / total) if total else 0.0,
+        solve_rate=(solved / eligible) if eligible else 0.0,
         solved=solved,
         total=total,
+        eligible=eligible,
+        unsupported=unsupported,
         avg_cost_usd=_mean(costs),
         avg_latency_ms=_mean(latencies),
         median_latency_ms=_median(latencies),
@@ -78,11 +82,13 @@ def _build_comparison_aggregate(tasks: list[TaskBenchmarkResult]) -> ComparisonA
     recursive_win = sum(1 for task in tasks if task.comparison == "recursive_win")
     tie_solved = sum(1 for task in tasks if task.comparison == "tie_solved")
     tie_failed = sum(1 for task in tasks if task.comparison == "tie_failed")
+    unsupported = sum(1 for task in tasks if task.comparison == "unsupported")
     return ComparisonAggregate(
         baseline_win=baseline_win,
         recursive_win=recursive_win,
         tie_solved=tie_solved,
         tie_failed=tie_failed,
+        unsupported=unsupported,
     )
 
 
@@ -95,6 +101,8 @@ def _write_csv(report: dict, path: Path) -> None:
         "comparison",
         "baseline_solved",
         "baseline_runtime_status",
+        "baseline_score_status",
+        "baseline_score_error",
         "baseline_cost_usd",
         "baseline_duration_ms",
         "baseline_tree_depth",
@@ -102,6 +110,8 @@ def _write_csv(report: dict, path: Path) -> None:
         "baseline_node_count",
         "recursive_solved",
         "recursive_runtime_status",
+        "recursive_score_status",
+        "recursive_score_error",
         "recursive_cost_usd",
         "recursive_duration_ms",
         "recursive_tree_depth",
@@ -123,6 +133,8 @@ def _write_csv(report: dict, path: Path) -> None:
                     "comparison": task["comparison"],
                     "baseline_solved": baseline["solved"],
                     "baseline_runtime_status": baseline["runtime_status"],
+                    "baseline_score_status": baseline["score"]["status"],
+                    "baseline_score_error": baseline["score"]["error"],
                     "baseline_cost_usd": baseline["cost"]["total_usd"],
                     "baseline_duration_ms": baseline["duration_ms"],
                     "baseline_tree_depth": baseline["tree_depth"],
@@ -130,6 +142,8 @@ def _write_csv(report: dict, path: Path) -> None:
                     "baseline_node_count": baseline["node_count"],
                     "recursive_solved": recursive["solved"],
                     "recursive_runtime_status": recursive["runtime_status"],
+                    "recursive_score_status": recursive["score"]["status"],
+                    "recursive_score_error": recursive["score"]["error"],
                     "recursive_cost_usd": recursive["cost"]["total_usd"],
                     "recursive_duration_ms": recursive["duration_ms"],
                     "recursive_tree_depth": recursive["tree_depth"],

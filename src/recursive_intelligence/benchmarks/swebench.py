@@ -7,6 +7,7 @@ import re
 import shlex
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from recursive_intelligence.benchmarks.models import SWEBenchTask
@@ -50,6 +51,34 @@ REPO_TEST_COMMANDS: dict[str, str] = {
 REPO_TEST_COMMAND_OVERRIDES: dict[tuple[str, str], str] = {
     ("django/django", "1.9"): "./tests/runtests.py --verbosity 2",
 }
+
+
+@dataclass(frozen=True)
+class PythonRequirement:
+    """Interpreter requirement needed to score a benchmark task."""
+
+    minimum: tuple[int, int] | None = None
+    maximum: tuple[int, int] | None = None
+    reason: str = ""
+
+    def matches(self, version: tuple[int, int, int]) -> bool:
+        major_minor = version[:2]
+        if self.minimum is not None and major_minor < self.minimum:
+            return False
+        if self.maximum is not None and major_minor > self.maximum:
+            return False
+        return True
+
+    def describe(self) -> str:
+        bounds: list[str] = []
+        if self.minimum is not None:
+            bounds.append(f">={self.minimum[0]}.{self.minimum[1]}")
+        if self.maximum is not None:
+            bounds.append(f"<={self.maximum[0]}.{self.maximum[1]}")
+        summary = " and ".join(bounds) if bounds else "any"
+        if self.reason:
+            return f"Python {summary} ({self.reason})"
+        return f"Python {summary}"
 
 
 class SWEBenchLoader:
@@ -196,6 +225,16 @@ def resolve_test_command(task: SWEBenchTask) -> str:
 
     quoted_directives = " ".join(shlex.quote(directive) for directive in task.test_directives)
     return f"{base_command} {quoted_directives}".strip()
+
+
+def resolve_python_requirement(task: SWEBenchTask) -> PythonRequirement | None:
+    """Return interpreter constraints needed to run a task's repo tests."""
+    if task.repo == "sympy/sympy" and task.version == "1.1":
+        return PythonRequirement(
+            maximum=(3, 9),
+            reason="SymPy 1.1 imports collections.Mapping, removed in Python 3.10+",
+        )
+    return None
 
 
 def parse_diff_files(diff_text: str) -> list[str]:

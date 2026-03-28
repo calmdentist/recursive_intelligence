@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +27,7 @@ from recursive_intelligence.benchmarks.swebench import (
     DEFAULT_DATASET,
     DEFAULT_SPLIT,
     resolve_test_command,
+    resolve_python_requirement,
 )
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.runtime.baseline import BaselineRunner
@@ -250,13 +255,26 @@ class BenchmarkRunner:
                 )
 
             command = resolve_test_command(task)
-            completed = subprocess.run(
+            python_selection = _select_task_python(task)
+            if python_selection["status"] == "unsupported":
+                message = python_selection["error"]
+                log_path.write_text(message)
+                return PatchScore(
+                    status="unsupported_environment",
+                    patch_applied=True,
+                    tests_passed=False,
+                    exit_code=None,
+                    test_command=command,
+                    log_path=str(log_path),
+                    error=message,
+                    python_requirement=python_selection["requirement"],
+                )
+
+            completed = _run_test_command(
                 command,
-                cwd=str(repo_dir),
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.test_timeout_seconds,
+                repo_dir,
+                self.test_timeout_seconds,
+                python_executable=python_selection["python_executable"],
             )
             log_path.write_text((completed.stdout or "") + "\n" + (completed.stderr or ""))
             passed = completed.returncode == 0
@@ -267,6 +285,8 @@ class BenchmarkRunner:
                 exit_code=completed.returncode,
                 test_command=command,
                 log_path=str(log_path),
+                python_executable=python_selection["python_executable"],
+                python_requirement=python_selection["requirement"],
             )
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + "\n" + (exc.stderr or "")
@@ -279,6 +299,7 @@ class BenchmarkRunner:
                 test_command=resolve_test_command(task),
                 log_path=str(log_path),
                 error="Test command timed out",
+                python_requirement=_describe_python_requirement(task),
             )
         finally:
             if self.cleanup_task_dirs and not self.keep_task_dirs:
@@ -293,6 +314,8 @@ class BenchmarkRunner:
 
 
 def compare_modes(baseline: BenchmarkModeResult, recursive: BenchmarkModeResult) -> str:
+    if _is_unsupported_score(baseline.score) or _is_unsupported_score(recursive.score):
+        return "unsupported"
     if recursive.solved and not baseline.solved:
         return "recursive_win"
     if baseline.solved and not recursive.solved:
@@ -349,6 +372,189 @@ def _git_changed_files(worktree: str, base_commit: str) -> list[str]:
         text=True,
     )
     return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _run_test_command(
+    command: str,
+    repo_dir: Path,
+    timeout_seconds: int,
+    python_executable: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    tokens = shlex.split(command)
+    env = os.environ.copy()
+
+    idx = 0
+    while idx < len(tokens) and _is_env_assignment(tokens[idx]):
+        key, _, value = tokens[idx].partition("=")
+        env[key] = value
+        idx += 1
+
+    argv = tokens[idx:]
+    if not argv:
+        raise ValueError(f"Malformed test command: {command}")
+
+    argv = _normalize_python_runner(argv, repo_dir, python_executable)
+    return subprocess.run(
+        argv,
+        cwd=str(repo_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def _normalize_python_runner(
+    argv: list[str],
+    repo_dir: Path,
+    python_executable: str | None = None,
+) -> list[str]:
+    executable = argv[0]
+    executable_name = Path(executable).name
+    script_path = (repo_dir / executable).resolve() if not Path(executable).is_absolute() else Path(executable)
+    python_missing = shutil.which("python") is None
+    fallback_python = python_executable or shutil.which("python3")
+
+    if python_executable and executable_name.startswith("python"):
+        return [python_executable, *argv[1:]]
+
+    if python_executable and executable in {"pytest", "py.test"}:
+        return [python_executable, "-m", "pytest", *argv[1:]]
+
+    if (
+        python_missing
+        and fallback_python
+        and script_path.exists()
+        and script_path.is_file()
+        and _uses_env_python(script_path)
+    ):
+        return [fallback_python, str(script_path), *argv[1:]]
+
+    if (
+        python_executable
+        and script_path.exists()
+        and script_path.is_file()
+        and _uses_python_shebang(script_path)
+    ):
+        return [python_executable, str(script_path), *argv[1:]]
+
+    return argv
+
+
+def _uses_env_python(script_path: Path) -> bool:
+    try:
+        first_line = script_path.read_text(errors="ignore").splitlines()[0]
+    except IndexError:
+        return False
+    return first_line.startswith("#!") and "env python" in first_line
+
+
+def _uses_python_shebang(script_path: Path) -> bool:
+    try:
+        first_line = script_path.read_text(errors="ignore").splitlines()[0]
+    except IndexError:
+        return False
+    return first_line.startswith("#!") and "python" in first_line
+
+
+def _is_env_assignment(token: str) -> bool:
+    if "=" not in token:
+        return False
+    name, _, _ = token.partition("=")
+    return bool(name) and (name[0].isalpha() or name[0] == "_") and all(
+        ch.isalnum() or ch == "_" for ch in name
+    )
+
+
+def _is_unsupported_score(score: PatchScore) -> bool:
+    return score.status == "unsupported_environment"
+
+
+def _describe_python_requirement(task: SWEBenchTask) -> str | None:
+    requirement = resolve_python_requirement(task)
+    if requirement is None:
+        return None
+    return requirement.describe()
+
+
+def _select_task_python(task: SWEBenchTask) -> dict[str, str | None]:
+    requirement = resolve_python_requirement(task)
+    if requirement is None:
+        return {
+            "status": "supported",
+            "python_executable": None,
+            "requirement": None,
+            "error": None,
+        }
+
+    for executable, version in _available_python_interpreters():
+        if requirement.matches(version):
+            return {
+                "status": "supported",
+                "python_executable": executable,
+                "requirement": requirement.describe(),
+                "error": None,
+            }
+
+    available = ", ".join(
+        f"{Path(executable).name} ({version[0]}.{version[1]}.{version[2]})"
+        for executable, version in _available_python_interpreters()
+    ) or "none"
+    return {
+        "status": "unsupported",
+        "python_executable": None,
+        "requirement": requirement.describe(),
+        "error": (
+            f"Unsupported benchmark environment: requires {requirement.describe()}, "
+            f"but available interpreters are {available}."
+        ),
+    }
+
+
+@lru_cache(maxsize=1)
+def _available_python_interpreters() -> tuple[tuple[str, tuple[int, int, int]], ...]:
+    names = [
+        Path(sys.executable).name,
+        "python",
+        "python3",
+        "python3.13",
+        "python3.12",
+        "python3.11",
+        "python3.10",
+        "python3.9",
+        "python3.8",
+    ]
+    interpreters: list[tuple[str, tuple[int, int, int]]] = []
+    seen: set[str] = set()
+    for name in names:
+        path = shutil.which(name)
+        if path is None or path in seen:
+            continue
+        version = _python_version(path)
+        if version is None:
+            continue
+        interpreters.append((path, version))
+        seen.add(path)
+    return tuple(interpreters)
+
+
+def _python_version(executable: str) -> tuple[int, int, int] | None:
+    result = subprocess.run(
+        [
+            executable,
+            "-c",
+            "import sys; print('.'.join(str(part) for part in sys.version_info[:3]))",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    parts = raw.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
 
 
 def _summarize_recursive_run(config: RuntimeConfig, run_id: str, base_commit: str) -> dict:
