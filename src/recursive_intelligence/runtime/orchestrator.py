@@ -257,7 +257,9 @@ class Orchestrator:
         store.finish_session(result.session_id)
 
         store.append_event(node.run_id, node.node_id, "plan_result", {
-            "session_id": result.session_id, "raw": result.raw,
+            "session_id": result.session_id,
+            "raw": result.raw,
+            "cost": _cost_to_dict(result.cost),
         })
 
         decision = self._parse_plan_decision(result.raw)
@@ -377,7 +379,9 @@ class Orchestrator:
 
         store.update_node(node.node_id, session_id=result.session_id)
         store.append_event(node.run_id, node.node_id, "execution_result", {
-            "session_id": result.session_id, "raw": result.raw,
+            "session_id": result.session_id,
+            "raw": result.raw,
+            "cost": _cost_to_dict(result.cost),
         })
 
         # Auto-update domain registry with actual changed files
@@ -601,6 +605,12 @@ class Orchestrator:
                 continue
 
             store.update_node(node.node_id, session_id=result.session_id)
+            store.append_event(node.run_id, node.node_id, "review_result", {
+                "child_id": child.node_id,
+                "session_id": result.session_id,
+                "raw": result.raw,
+                "cost": _cost_to_dict(result.cost),
+            })
             verdict = self._parse_review_verdict(result.raw, child.node_id)
             log.info("Node %s review of %s: %s", node.node_id, child.node_id, verdict.verdict)
 
@@ -902,6 +912,16 @@ def _merge_base(worktree: Path, sha_a: str, sha_b: str) -> str | None:
     if result.returncode == 0:
         return result.stdout.strip()
     return None
+
+
+def _cost_to_dict(cost) -> dict[str, Any]:
+    if cost is None:
+        return {"input_tokens": 0, "output_tokens": 0, "total_usd": 0.0}
+    return {
+        "input_tokens": cost.input_tokens,
+        "output_tokens": cost.output_tokens,
+        "total_usd": cost.total_usd,
+    }
 
 
 def get_node_tree(store: StateStore, run_id: str) -> list[dict[str, Any]]:
