@@ -63,6 +63,32 @@ def abort_cherry_pick(worktree: Path) -> None:
         pass
 
 
+def get_conflict_diff(worktree: Path) -> str:
+    """Get the full diff showing conflict markers for unresolved files."""
+    try:
+        return _git(worktree, "diff")
+    except MergeError:
+        return ""
+
+
+def stage_and_continue_cherry_pick(worktree: Path) -> str:
+    """After resolving conflicts, stage all and continue the cherry-pick.
+
+    Returns the new HEAD SHA.
+    """
+    _git(worktree, "add", "-A")
+    try:
+        _git(worktree, "cherry-pick", "--continue")
+    except MergeError:
+        # --continue may fail if there's nothing to commit (all resolved identically)
+        # In that case, try to skip
+        try:
+            _git(worktree, "cherry-pick", "--skip")
+        except MergeError:
+            pass
+    return _git(worktree, "rev-parse", "HEAD").strip()
+
+
 def get_diff(worktree: Path, base_ref: str = "HEAD~1") -> str:
     """Get the diff for the latest commit."""
     try:

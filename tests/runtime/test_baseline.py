@@ -24,7 +24,7 @@ class MockAdapter(AgentAdapter):
     def name(self) -> str:
         return "mock"
 
-    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
         # Simulate making a change if requested
         if self._commit and mode == "execute":
             test_file = Path(worktree) / "output.txt"

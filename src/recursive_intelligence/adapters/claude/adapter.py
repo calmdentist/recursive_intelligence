@@ -32,6 +32,7 @@ class ClaudeAdapter(AgentAdapter):
         system_prompt: str | None = None,
         resume_session_id: str | None = None,
         on_message: StreamCallback = None,
+        is_root: bool = False,
     ) -> NodeResult:
         from claude_agent_sdk import (
             AssistantMessage,
@@ -48,11 +49,18 @@ class ClaudeAdapter(AgentAdapter):
         mode_config = get_mode_config(mode)
         sys_prompt = system_prompt or SYSTEM_CONTRACT
 
+        # All nodes use Opus 4.6 with adaptive thinking.
+        # Root node additionally gets 1M context window.
+        model = "claude-opus-4-6"
+        betas = ["context-1m-2025-08-07"] if is_root else []
+
         if resume_session_id:
             options = ClaudeAgentOptions(
                 cwd=str(worktree),
                 resume=resume_session_id,
-                model=self._model,
+                model=model,
+                thinking={"type": "adaptive"},
+                **({"betas": betas} if betas else {}),
             )
         else:
             options = ClaudeAgentOptions(
@@ -60,8 +68,10 @@ class ClaudeAdapter(AgentAdapter):
                 allowed_tools=mode_config.allowed_tools,
                 permission_mode=mode_config.permission_mode,
                 system_prompt=sys_prompt,
-                model=self._model,
+                model=model,
                 setting_sources=["project"],
+                thinking={"type": "adaptive"},
+                **({"betas": betas} if betas else {}),
             )
 
         session_id: str | None = resume_session_id

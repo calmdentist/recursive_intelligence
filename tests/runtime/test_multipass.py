@@ -26,7 +26,7 @@ class ScriptedAdapter(AgentAdapter):
     def calls(self) -> list[dict]:
         return self._call_log
 
-    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None):
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
         if not self._responses:
             raise RuntimeError(f"ScriptedAdapter ran out of responses (call #{len(self._call_log) + 1}, mode={mode})")
 
