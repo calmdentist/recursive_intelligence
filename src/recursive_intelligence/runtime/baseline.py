@@ -111,6 +111,7 @@ class BaselineRunner:
             prompt=task,
             worktree=wt_path,
             mode="execute",
+            is_root=True,
         )
 
         store.update_node(node.node_id, session_id=result.session_id)

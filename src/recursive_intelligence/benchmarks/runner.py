@@ -37,6 +37,8 @@ class BenchmarkRunner:
         self,
         config: RuntimeConfig,
         model: str = "claude-opus-4-6",
+        root_model: str | None = None,
+        child_model: str | None = None,
         adapter_factory: AdapterFactory | None = None,
         patch_evaluator: PatchEvaluator | None = None,
         keep_task_dirs: bool = False,
@@ -46,6 +48,8 @@ class BenchmarkRunner:
     ) -> None:
         self.config = config
         self.model = model
+        self.root_model = root_model or model
+        self.child_model = child_model or self.root_model
         self.adapter_factory = adapter_factory
         self.patch_evaluator = patch_evaluator
         self.keep_task_dirs = keep_task_dirs
@@ -227,7 +231,9 @@ class BenchmarkRunner:
             return self.adapter_factory(mode, task)
         from recursive_intelligence.adapters.claude.adapter import ClaudeAdapter
 
-        return ClaudeAdapter(model=self.model)
+        if mode == "baseline":
+            return ClaudeAdapter(root_model=self.root_model, child_model=self.root_model)
+        return ClaudeAdapter(root_model=self.root_model, child_model=self.child_model)
 
 
 def compare_modes(baseline: BenchmarkModeResult, recursive: BenchmarkModeResult) -> str:

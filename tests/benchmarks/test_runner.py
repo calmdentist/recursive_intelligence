@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult
+from recursive_intelligence.adapters.claude.adapter import ClaudeAdapter
 from recursive_intelligence.benchmarks.evaluation import (
     LocalPatchEvaluator,
     OfficialHarnessEvaluator,
@@ -260,6 +261,26 @@ def test_official_harness_evaluator_reads_instance_report(
     assert score.log_path is not None
 
 
+def test_benchmark_runner_configures_distinct_root_and_child_models(tmp_path: Path):
+    config = RuntimeConfig(repo_root=tmp_path)
+    runner = BenchmarkRunner(
+        config,
+        model="claude-sonnet-4-6",
+        root_model="claude-opus-4-6",
+        child_model="claude-haiku-4-5",
+    )
+
+    baseline_adapter = runner._make_adapter("baseline", _dummy_task())
+    recursive_adapter = runner._make_adapter("recursive", _dummy_task())
+
+    assert isinstance(baseline_adapter, ClaudeAdapter)
+    assert isinstance(recursive_adapter, ClaudeAdapter)
+    assert baseline_adapter._model_for_node(is_root=True) == "claude-opus-4-6"
+    assert baseline_adapter._model_for_node(is_root=False) == "claude-opus-4-6"
+    assert recursive_adapter._model_for_node(is_root=True) == "claude-opus-4-6"
+    assert recursive_adapter._model_for_node(is_root=False) == "claude-haiku-4-5"
+
+
 def test_report_excludes_unsupported_tasks_from_solve_rate():
     unsupported_score = PatchScore(
         status="unsupported_environment",
@@ -359,3 +380,17 @@ def test_report_excludes_unsupported_tasks_from_solve_rate():
     assert mixed_report.baseline.eligible == 1
     assert mixed_report.baseline.unsupported == 1
     assert mixed_report.baseline.solve_rate == 1.0
+
+
+def _dummy_task() -> SWEBenchTask:
+    return SWEBenchTask(
+        instance_id="task-1",
+        repo="owner/repo",
+        base_commit="abc123",
+        problem_statement="fix it",
+        patch="",
+        test_patch="",
+        version="test",
+        fail_to_pass=[],
+        pass_to_pass=[],
+    )

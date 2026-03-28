@@ -45,6 +45,25 @@ class MockAdapter(AgentAdapter):
         )
 
 
+class RootFlagAdapter(AgentAdapter):
+    def __init__(self) -> None:
+        self.is_root_calls: list[bool] = []
+
+    @property
+    def name(self) -> str:
+        return "root-flag"
+
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+        self.is_root_calls.append(is_root)
+        return NodeResult(
+            session_id="root-flag-session",
+            raw={"status": "implemented"},
+            result_text="",
+            cost=CostRecord(),
+            stop_reason="end_turn",
+        )
+
+
 @pytest.fixture
 def git_repo(tmp_path):
     """Create a minimal git repo."""
@@ -160,3 +179,13 @@ class TestBaselineRunner:
 
         with pytest.raises(WorktreeError, match="uncommitted"):
             await runner.run("task")
+
+    @pytest.mark.asyncio
+    async def test_baseline_marks_session_as_root(self, config, git_repo):
+        adapter = RootFlagAdapter()
+        runner = BaselineRunner(config, adapter)
+
+        with patch("recursive_intelligence.runtime.baseline._capture_transcript", return_value=None):
+            await runner.run("compare baseline fairly")
+
+        assert adapter.is_root_calls == [True]
