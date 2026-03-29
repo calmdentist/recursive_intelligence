@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from recursive_intelligence.benchmarks.models import (
+    BenchmarkRunConfig,
     BenchmarkSuiteReport,
     ComparisonAggregate,
     ModeAggregate,
@@ -23,6 +24,7 @@ def build_suite_report(
     dataset: str,
     split: str,
     tasks: list[TaskBenchmarkResult],
+    config: BenchmarkRunConfig | None = None,
 ) -> BenchmarkSuiteReport:
     return BenchmarkSuiteReport(
         run_id=run_id,
@@ -35,6 +37,7 @@ def build_suite_report(
         baseline=_build_mode_aggregate(tasks, "baseline"),
         recursive=_build_mode_aggregate(tasks, "recursive"),
         comparison=_build_comparison_aggregate(tasks),
+        config=config or BenchmarkRunConfig(),
         tasks=tasks,
     )
 
@@ -99,6 +102,14 @@ def _write_csv(report: dict, path: Path) -> None:
         "version",
         "complexity_score",
         "comparison",
+        "config_fallback_model",
+        "config_root_model",
+        "config_child_model",
+        "config_evaluation_backend",
+        "config_evaluation_namespace",
+        "config_requested_limit",
+        "config_max_concurrency",
+        "config_test_timeout_seconds",
         "baseline_solved",
         "baseline_runtime_status",
         "baseline_score_status",
@@ -125,6 +136,7 @@ def _write_csv(report: dict, path: Path) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
+        config = report.get("config", {})
         for task in report.get("tasks", []):
             baseline = task["baseline"]
             recursive = task["recursive"]
@@ -135,6 +147,14 @@ def _write_csv(report: dict, path: Path) -> None:
                     "version": task["version"],
                     "complexity_score": task["complexity_score"],
                     "comparison": task["comparison"],
+                    "config_fallback_model": config.get("fallback_model"),
+                    "config_root_model": config.get("root_model"),
+                    "config_child_model": config.get("child_model"),
+                    "config_evaluation_backend": config.get("evaluation_backend"),
+                    "config_evaluation_namespace": config.get("evaluation_namespace"),
+                    "config_requested_limit": config.get("requested_limit"),
+                    "config_max_concurrency": config.get("max_concurrency"),
+                    "config_test_timeout_seconds": config.get("test_timeout_seconds"),
                     "baseline_solved": baseline["solved"],
                     "baseline_runtime_status": baseline["runtime_status"],
                     "baseline_score_status": baseline["score"]["status"],

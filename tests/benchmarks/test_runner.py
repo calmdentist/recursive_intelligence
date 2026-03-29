@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -15,7 +16,12 @@ from recursive_intelligence.benchmarks.evaluation import (
     _run_test_command,
     _select_task_python,
 )
-from recursive_intelligence.benchmarks.models import BenchmarkModeResult, PatchScore, SWEBenchTask, TaskBenchmarkResult
+from recursive_intelligence.benchmarks.models import (
+    BenchmarkModeResult,
+    PatchScore,
+    SWEBenchTask,
+    TaskBenchmarkResult,
+)
 from recursive_intelligence.benchmarks.reporting import build_suite_report, export_report
 from recursive_intelligence.benchmarks.runner import BenchmarkRunner, compare_modes
 from recursive_intelligence.config import RuntimeConfig
@@ -142,15 +148,31 @@ async def test_benchmark_runner_persists_reports_and_exports(tmp_path: Path, sou
 
     runner = BenchmarkRunner(
         config,
+        model="claude-opus-4-6",
+        root_model="claude-sonnet-4-6",
+        child_model="claude-haiku-4-5",
         adapter_factory=adapter_factory,
         patch_evaluator=LocalPatchEvaluator(),
+        max_concurrency=2,
     )
-    report = await runner.run_swebench_suite([task], suite="tier-a", dataset="local", split="test")
+    report = await runner.run_swebench_suite(
+        [task],
+        suite="tier-a",
+        dataset="local",
+        split="test",
+        requested_limit=1,
+    )
 
     assert report.task_count == 1
     assert report.baseline.solved == 1
     assert report.recursive.solved == 1
     assert report.comparison.tie_solved == 1
+    assert report.config.fallback_model == "claude-opus-4-6"
+    assert report.config.root_model == "claude-sonnet-4-6"
+    assert report.config.child_model == "claude-haiku-4-5"
+    assert report.config.evaluation_backend == "local_patch"
+    assert report.config.requested_limit == 1
+    assert report.config.max_concurrency == 2
 
     run_dir = config.benchmarks_dir / report.run_id
     task_dir = run_dir / "artifacts" / task.instance_id
@@ -165,6 +187,7 @@ async def test_benchmark_runner_persists_reports_and_exports(tmp_path: Path, sou
     exported = export_report(run_dir / "report.json", tmp_path / "exports")
     assert len(exported) == 2
     assert all(path.exists() for path in exported)
+    assert "config_root_model" in exported[1].read_text()
 
 
 def test_run_test_command_uses_python3_for_env_python_scripts(tmp_path: Path):
@@ -281,6 +304,38 @@ def test_benchmark_runner_configures_distinct_root_and_child_models(tmp_path: Pa
     assert recursive_adapter._model_for_node(is_root=False) == "claude-haiku-4-5"
 
 
+@pytest.mark.asyncio
+async def test_benchmark_runner_executes_tasks_in_parallel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config = RuntimeConfig(repo_root=tmp_path)
+    runner = BenchmarkRunner(
+        config,
+        patch_evaluator=LocalPatchEvaluator(),
+        max_concurrency=2,
+    )
+    tasks = [
+        _task_with_id("task-a"),
+        _task_with_id("task-b"),
+    ]
+    started = 0
+    both_started = asyncio.Event()
+
+    async def _fake_run_task(benchmark_run_id, task, evaluator):
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.2)
+        return _task_result(task.instance_id)
+
+    monkeypatch.setattr(runner, "run_task", _fake_run_task)
+
+    report = await runner.run_swebench_suite(tasks, suite="tier-a", dataset="local", split="test")
+
+    assert report.task_count == 2
+    assert [task.instance_id for task in report.tasks] == ["task-a", "task-b"]
+    assert report.config.max_concurrency == 2
+
+
 def test_report_excludes_unsupported_tasks_from_solve_rate():
     unsupported_score = PatchScore(
         status="unsupported_environment",
@@ -393,4 +448,65 @@ def _dummy_task() -> SWEBenchTask:
         version="test",
         fail_to_pass=[],
         pass_to_pass=[],
+    )
+
+
+def _task_with_id(instance_id: str) -> SWEBenchTask:
+    task = _dummy_task()
+    task.instance_id = instance_id
+    return task
+
+
+def _task_result(instance_id: str) -> TaskBenchmarkResult:
+    solved_score = PatchScore(
+        status="passed",
+        patch_applied=True,
+        tests_passed=True,
+        exit_code=0,
+        test_command="pytest",
+    )
+    mode = BenchmarkModeResult(
+        mode="baseline",
+        run_id=f"run-{instance_id}",
+        runtime_status="completed",
+        solved=True,
+        changed_files=["app.py"],
+        cost=CostRecord(total_usd=0.1),
+        duration_ms=100,
+        session_ids=[f"session-{instance_id}"],
+        session_count=1,
+        node_count=1,
+        tree_depth=0,
+        tree_breadth=0,
+        patch_path=None,
+        patch_bytes=10,
+        ri_artifacts_path=None,
+        score=solved_score,
+    )
+    recursive_mode = BenchmarkModeResult(
+        mode="recursive",
+        run_id=f"run-{instance_id}-recursive",
+        runtime_status="completed",
+        solved=True,
+        changed_files=["app.py"],
+        cost=CostRecord(total_usd=0.1),
+        duration_ms=100,
+        session_ids=[f"session-{instance_id}-recursive"],
+        session_count=1,
+        node_count=1,
+        tree_depth=0,
+        tree_breadth=0,
+        patch_path=None,
+        patch_bytes=10,
+        ri_artifacts_path=None,
+        score=solved_score,
+    )
+    return TaskBenchmarkResult(
+        instance_id=instance_id,
+        repo="owner/repo",
+        version="test",
+        complexity_score=1,
+        baseline=mode,
+        recursive=recursive_mode,
+        comparison="tie_solved",
     )

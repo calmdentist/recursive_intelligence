@@ -370,6 +370,7 @@ def benchmark(ctx: click.Context) -> None:
 @click.option("--model", default="claude-opus-4-6", help="Fallback model for both root and child nodes")
 @click.option("--root-model", default=None, help="Claude model for baseline and recursive root nodes")
 @click.option("--child-model", default=None, help="Claude model for recursive child nodes")
+@click.option("--max-concurrency", type=int, default=2, show_default=True, help="Max concurrent benchmark tasks")
 @click.option(
     "--namespace",
     default=None,
@@ -387,6 +388,7 @@ def benchmark_swebench(
     model: str,
     root_model: str | None,
     child_model: str | None,
+    max_concurrency: int,
     namespace: str | None,
 ) -> None:
     """Benchmark recursive intelligence on SWE-bench."""
@@ -407,8 +409,17 @@ def benchmark_swebench(
             child_model=child_model,
             keep_task_dirs=keep_task_dirs,
             evaluation_namespace=namespace,
+            max_concurrency=max_concurrency,
         )
-        report = asyncio.run(runner.run_swebench_suite(tasks, suite=suite, dataset=dataset, split=split))
+        report = asyncio.run(
+            runner.run_swebench_suite(
+                tasks,
+                suite=suite,
+                dataset=dataset,
+                split=split,
+                requested_limit=limit,
+            )
+        )
 
         click.echo(f"{INDENT}{_dim('benchmark')} {report.run_id}")
         click.echo(f"{INDENT}{_dim('tasks')}      {report.task_count}")

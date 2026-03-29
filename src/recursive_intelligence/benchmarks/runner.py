@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from typing import Callable
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord
 from recursive_intelligence.benchmarks.evaluation import OfficialHarnessEvaluator, PatchEvaluator
 from recursive_intelligence.benchmarks.models import (
+    BenchmarkRunConfig,
     BenchmarkModeResult,
     PatchScore,
     SWEBenchTask,
@@ -45,6 +47,7 @@ class BenchmarkRunner:
         cleanup_task_dirs: bool = True,
         test_timeout_seconds: int = 1800,
         evaluation_namespace: str | None = None,
+        max_concurrency: int = 2,
     ) -> None:
         self.config = config
         self.model = model
@@ -56,6 +59,7 @@ class BenchmarkRunner:
         self.cleanup_task_dirs = cleanup_task_dirs
         self.test_timeout_seconds = test_timeout_seconds
         self.evaluation_namespace = evaluation_namespace
+        self.max_concurrency = max(1, max_concurrency)
 
     async def run_swebench_suite(
         self,
@@ -63,6 +67,7 @@ class BenchmarkRunner:
         suite: str,
         dataset: str = DEFAULT_DATASET,
         split: str = DEFAULT_SPLIT,
+        requested_limit: int | None = None,
     ):
         self.config.ensure_dirs()
         run_id = _new_benchmark_id()
@@ -75,17 +80,43 @@ class BenchmarkRunner:
             timeout_seconds=self.test_timeout_seconds,
             namespace=self.evaluation_namespace,
         )
+        report_config = self._build_report_config(evaluator, requested_limit)
+        results: list[TaskBenchmarkResult | None] = [None] * len(tasks)
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+        report_lock = asyncio.Lock()
 
-        results: list[TaskBenchmarkResult] = []
-        for task in tasks:
-            result = await self.run_task(run_id, task, evaluator)
-            results.append(result)
+        async def _run_one(index: int, task: SWEBenchTask) -> None:
+            async with semaphore:
+                result = await self.run_task(run_id, task, evaluator)
             task_path = tasks_dir / f"{task.instance_id}.json"
             task_path.write_text(json.dumps(result.to_dict(), indent=2))
-            report = build_suite_report(run_id, "swebench", suite, dataset, split, results)
-            (run_dir / "report.json").write_text(json.dumps(report.to_dict(), indent=2))
+            async with report_lock:
+                results[index] = result
+                partial_results = [item for item in results if item is not None]
+                report = build_suite_report(
+                    run_id,
+                    "swebench",
+                    suite,
+                    dataset,
+                    split,
+                    partial_results,
+                    config=report_config,
+                )
+                (run_dir / "report.json").write_text(json.dumps(report.to_dict(), indent=2))
 
-        return build_suite_report(run_id, "swebench", suite, dataset, split, results)
+        await asyncio.gather(*[_run_one(index, task) for index, task in enumerate(tasks)])
+        final_results = [item for item in results if item is not None]
+        final_report = build_suite_report(
+            run_id,
+            "swebench",
+            suite,
+            dataset,
+            split,
+            final_results,
+            config=report_config,
+        )
+        (run_dir / "report.json").write_text(json.dumps(final_report.to_dict(), indent=2))
+        return final_report
 
     async def run_task(
         self,
@@ -125,7 +156,7 @@ class BenchmarkRunner:
         ri_artifacts_dir = task_dir / f"{mode}-ri"
 
         try:
-            _clone_repo(task.repo, task.base_commit, repo_dir)
+            await asyncio.to_thread(_clone_repo, task.repo, task.base_commit, repo_dir)
             runtime_config = RuntimeConfig(repo_root=repo_dir)
             adapter = self._make_adapter(mode, task)
             start = time.perf_counter()
@@ -135,10 +166,15 @@ class BenchmarkRunner:
                 report = await runner.run(task.build_prompt())
                 duration_ms = int((time.perf_counter() - start) * 1000)
                 baseline_worktree = runtime_config.worktrees_dir / f"{report.run_id}-baseline"
-                patch_text = _git_diff(repo_dir, task.base_commit, worktree=str(baseline_worktree))
+                patch_text = await asyncio.to_thread(
+                    _git_diff,
+                    repo_dir,
+                    task.base_commit,
+                    str(baseline_worktree),
+                )
                 patch_path.write_text(patch_text)
-                _copy_ri_artifacts(repo_dir, ri_artifacts_dir)
-                score = self._score_patch(task, patch_text, task_dir, mode, evaluator)
+                await asyncio.to_thread(_copy_ri_artifacts, repo_dir, ri_artifacts_dir)
+                score = await asyncio.to_thread(self._score_patch, task, patch_text, task_dir, mode, evaluator)
                 return BenchmarkModeResult(
                     mode=mode,
                     run_id=report.run_id,
@@ -162,10 +198,15 @@ class BenchmarkRunner:
             run_id = await orchestrator.start_run(task.build_prompt())
             duration_ms = int((time.perf_counter() - start) * 1000)
             summary = _summarize_recursive_run(runtime_config, run_id, task.base_commit)
-            patch_text = _git_diff(repo_dir, task.base_commit, worktree=summary["root_worktree"])
+            patch_text = await asyncio.to_thread(
+                _git_diff,
+                repo_dir,
+                task.base_commit,
+                summary["root_worktree"],
+            )
             patch_path.write_text(patch_text)
-            _copy_ri_artifacts(repo_dir, ri_artifacts_dir)
-            score = self._score_patch(task, patch_text, task_dir, mode, evaluator)
+            await asyncio.to_thread(_copy_ri_artifacts, repo_dir, ri_artifacts_dir)
+            score = await asyncio.to_thread(self._score_patch, task, patch_text, task_dir, mode, evaluator)
             return BenchmarkModeResult(
                 mode=mode,
                 run_id=run_id,
@@ -234,6 +275,28 @@ class BenchmarkRunner:
         if mode == "baseline":
             return ClaudeAdapter(root_model=self.root_model, child_model=self.root_model)
         return ClaudeAdapter(root_model=self.root_model, child_model=self.child_model)
+
+    def _build_report_config(
+        self,
+        evaluator: PatchEvaluator,
+        requested_limit: int | None,
+    ) -> BenchmarkRunConfig:
+        if isinstance(evaluator, OfficialHarnessEvaluator):
+            evaluation_backend = "official_harness"
+            evaluation_namespace = evaluator.namespace
+        else:
+            evaluation_backend = "local_patch"
+            evaluation_namespace = self.evaluation_namespace
+        return BenchmarkRunConfig(
+            fallback_model=self.model,
+            root_model=self.root_model,
+            child_model=self.child_model,
+            evaluation_backend=evaluation_backend,
+            evaluation_namespace=evaluation_namespace,
+            requested_limit=requested_limit,
+            max_concurrency=self.max_concurrency,
+            test_timeout_seconds=self.test_timeout_seconds,
+        )
 
 
 def compare_modes(baseline: BenchmarkModeResult, recursive: BenchmarkModeResult) -> str:

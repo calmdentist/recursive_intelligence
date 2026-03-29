@@ -146,6 +146,23 @@ class ComparisonAggregate:
 
 
 @dataclass
+class BenchmarkRunConfig:
+    """Persisted benchmark configuration for reproducibility."""
+
+    fallback_model: str | None = None
+    root_model: str | None = None
+    child_model: str | None = None
+    evaluation_backend: str = "official_harness"
+    evaluation_namespace: str | None = None
+    requested_limit: int | None = None
+    max_concurrency: int = 1
+    test_timeout_seconds: int = 1800
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class BenchmarkSuiteReport:
     """Full persisted report for a benchmark suite run."""
 
@@ -160,6 +177,7 @@ class BenchmarkSuiteReport:
     recursive: ModeAggregate
     comparison: ComparisonAggregate
     tasks: list[TaskBenchmarkResult]
+    config: BenchmarkRunConfig = field(default_factory=BenchmarkRunConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

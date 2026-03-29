@@ -7,6 +7,7 @@ from recursive_intelligence.benchmarks.evaluation import (
 )
 from recursive_intelligence.benchmarks.models import (
     BenchmarkModeResult,
+    BenchmarkRunConfig,
     BenchmarkSuiteReport,
     PatchScore,
     SWEBenchTask,
@@ -26,6 +27,7 @@ from recursive_intelligence.benchmarks.swebench import (
 __all__ = [
     "BenchmarkModeResult",
     "BenchmarkRunner",
+    "BenchmarkRunConfig",
     "BenchmarkSuiteReport",
     "DEFAULT_DATASET",
     "DEFAULT_SPLIT",
