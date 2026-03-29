@@ -16,30 +16,30 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from recursive_intelligence.benchmarks.models import PatchScore, SWEBenchTask
+from recursive_intelligence.benchmarks.models import BenchmarkTask, PatchScore
 from recursive_intelligence.benchmarks.swebench import resolve_python_requirement, resolve_test_command
 
 
 class PatchEvaluator(Protocol):
     """Score a generated patch for one benchmark task."""
 
-    def score_patch(self, task: SWEBenchTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
+    backend_name: str
+
+    def score_patch(self, task: BenchmarkTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
         """Return a deterministic score record for the patch."""
 
 
 class LocalPatchEvaluator:
-    """Host-local patch application plus repo test execution.
+    """Host-local patch application plus repo test execution."""
 
-    This backend remains useful for unit tests and local fixture repos.
-    Production SWE-bench runs should use ``OfficialHarnessEvaluator``.
-    """
+    backend_name = "local_patch"
 
     def __init__(self, timeout_seconds: int = 1800, keep_task_dirs: bool = False, cleanup_task_dirs: bool = True):
         self.timeout_seconds = timeout_seconds
         self.keep_task_dirs = keep_task_dirs
         self.cleanup_task_dirs = cleanup_task_dirs
 
-    def score_patch(self, task: SWEBenchTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
+    def score_patch(self, task: BenchmarkTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
         if not patch_text.strip():
             return PatchScore(
                 status="no_patch",
@@ -146,8 +146,10 @@ class LocalPatchEvaluator:
                 shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
-class OfficialHarnessEvaluator:
+class SWEBenchHarnessEvaluator:
     """Score patches via the official SWE-bench Docker harness."""
+
+    backend_name = "swebench_harness"
 
     def __init__(
         self,
@@ -166,7 +168,7 @@ class OfficialHarnessEvaluator:
         self.max_workers = max_workers
         self._ensure_prerequisites()
 
-    def score_patch(self, task: SWEBenchTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
+    def score_patch(self, task: BenchmarkTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
         if not patch_text.strip():
             return PatchScore(
                 status="no_patch",
@@ -225,7 +227,13 @@ class OfficialHarnessEvaluator:
         report_path = instance_dir / "report.json"
         instance_log_path = instance_dir / "run_instance.log"
         test_output_path = instance_dir / "test_output.txt"
-        selected_log_path = test_output_path if test_output_path.exists() else instance_log_path if instance_log_path.exists() else harness_log_path
+        selected_log_path = (
+            test_output_path
+            if test_output_path.exists()
+            else instance_log_path
+            if instance_log_path.exists()
+            else harness_log_path
+        )
 
         if report_path.exists():
             report = json.loads(report_path.read_text())
@@ -262,6 +270,320 @@ class OfficialHarnessEvaluator:
             )
         if shutil.which("docker") is None:
             raise RuntimeError("Docker is required for official SWE-bench evaluation but was not found on PATH.")
+
+
+class SWEBenchProEvaluator:
+    """Score patches via the official SWE-Bench Pro evaluator."""
+
+    backend_name = "swebench_pro"
+
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str,
+        timeout_seconds: int = 1800,
+        python_executable: str | None = None,
+        max_workers: int = 1,
+        repo_path: str | Path | None = None,
+        dockerhub_username: str | None = None,
+        use_local_docker: bool = True,
+        docker_platform: str | None = None,
+    ) -> None:
+        self.dataset_name = dataset_name
+        self.split = split
+        self.timeout_seconds = timeout_seconds
+        self.python_executable = python_executable or sys.executable
+        self.max_workers = max_workers
+        self.repo_path = Path(
+            repo_path
+            or os.environ.get("RARI_SWEBENCH_PRO_REPO", "")
+            or ".ri/tools/SWE-bench_Pro-os"
+        )
+        self.dockerhub_username = dockerhub_username or os.environ.get("RARI_SWEBENCH_PRO_DOCKERHUB_USER", "jefzda")
+        self.use_local_docker = use_local_docker
+        self.docker_platform = docker_platform or _default_local_docker_platform()
+        self._ensure_prerequisites()
+
+    def score_patch(self, task: BenchmarkTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
+        if not patch_text.strip():
+            return PatchScore(
+                status="no_patch",
+                patch_applied=False,
+                tests_passed=False,
+                exit_code=None,
+                test_command="python swe_bench_pro_eval.py",
+                error="Solver produced an empty patch",
+            )
+
+        eval_dir = task_dir / f"{mode}-eval"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        harness_log_path = eval_dir / "harness.log"
+        raw_sample_path = eval_dir / "raw_sample.jsonl"
+        patches_path = eval_dir / "patches.json"
+        raw_sample_path.write_text(json.dumps(_build_swebench_pro_sample(task)) + "\n")
+        patches_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "instance_id": task.instance_id,
+                        "model_patch": patch_text,
+                        "prefix": mode,
+                    }
+                ],
+                indent=2,
+            )
+        )
+
+        command = [
+            self.python_executable,
+            "swe_bench_pro_eval.py",
+            "--raw_sample_path",
+            str(raw_sample_path),
+            "--patch_path",
+            str(patches_path),
+            "--output_dir",
+            str(eval_dir),
+            "--dockerhub_username",
+            self.dockerhub_username,
+            "--scripts_dir",
+            str(self.repo_path / "run_scripts"),
+            "--num_workers",
+            str(self.max_workers),
+        ]
+        if self.use_local_docker:
+            command.append("--use_local_docker")
+        if self.docker_platform:
+            command.extend(["--docker_platform", self.docker_platform])
+        completed = subprocess.run(command, cwd=str(self.repo_path), capture_output=True, text=True)
+        harness_log_path.write_text((completed.stdout or "") + "\n" + (completed.stderr or ""))
+
+        eval_results_path = eval_dir / "eval_results.json"
+        instance_dir = eval_dir / task.instance_id
+        stdout_log_path = instance_dir / f"{mode}_stdout.log"
+        stderr_log_path = instance_dir / f"{mode}_stderr.log"
+        output_json_path = instance_dir / f"{mode}_output.json"
+        selected_log_path = (
+            stderr_log_path
+            if stderr_log_path.exists()
+            else stdout_log_path
+            if stdout_log_path.exists()
+            else harness_log_path
+        )
+
+        resolved = False
+        if eval_results_path.exists():
+            eval_results = json.loads(eval_results_path.read_text())
+            resolved = bool(eval_results.get(task.instance_id, False))
+
+        patch_applied = _detect_swebench_pro_patch_applied(stdout_log_path, stderr_log_path, output_json_path)
+        if eval_results_path.exists():
+            return PatchScore(
+                status="passed" if resolved else "failed",
+                patch_applied=patch_applied,
+                tests_passed=resolved,
+                exit_code=completed.returncode,
+                test_command=shlex.join(command),
+                log_path=str(selected_log_path),
+                report_path=str(output_json_path if output_json_path.exists() else eval_results_path),
+                error=None if completed.returncode == 0 else _command_error_text(completed),
+            )
+
+        status = "patch_failed" if not patch_applied else "evaluation_error"
+        return PatchScore(
+            status=status,
+            patch_applied=patch_applied,
+            tests_passed=False,
+            exit_code=completed.returncode,
+            test_command=shlex.join(command),
+            log_path=str(selected_log_path),
+            error=_command_error_text(completed)
+            or "SWE-Bench Pro evaluation did not produce eval_results.json.",
+        )
+
+    def _ensure_prerequisites(self) -> None:
+        if shutil.which("docker") is None:
+            raise RuntimeError("Docker is required for SWE-Bench Pro evaluation but was not found on PATH.")
+        if not self.repo_path.exists():
+            raise RuntimeError(
+                "SWE-Bench Pro evaluator repo not found. "
+                "Set RARI_SWEBENCH_PRO_REPO to a checkout of scaleapi/SWE-bench_Pro-os."
+            )
+        if not (self.repo_path / "swe_bench_pro_eval.py").exists():
+            raise RuntimeError(
+                f"SWE-Bench Pro evaluator script not found at {(self.repo_path / 'swe_bench_pro_eval.py')}."
+            )
+        if not (self.repo_path / "run_scripts").exists():
+            raise RuntimeError(
+                f"SWE-Bench Pro run_scripts directory not found at {(self.repo_path / 'run_scripts')}."
+            )
+
+
+class FeatureBenchEvaluator:
+    """Score patches via the official FeatureBench evaluator."""
+
+    backend_name = "featurebench"
+
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str,
+        timeout_seconds: int = 1800,
+        python_executable: str | None = None,
+        max_workers: int = 1,
+        config_path: str | Path | None = None,
+    ) -> None:
+        self.dataset_name = dataset_name
+        self.split = split
+        self.timeout_seconds = timeout_seconds
+        self.python_executable = python_executable or sys.executable
+        self.max_workers = max_workers
+        self.config_path = str(config_path or os.environ.get("RARI_FEATUREBENCH_CONFIG_PATH", "")).strip() or None
+        self._runner_command = self._resolve_runner_command()
+        self._ensure_prerequisites()
+
+    def score_patch(self, task: BenchmarkTask, patch_text: str, task_dir: Path, mode: str) -> PatchScore:
+        eval_dir = task_dir / f"{mode}-eval"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        harness_log_path = eval_dir / "harness.log"
+        predictions_path = eval_dir / "output.jsonl"
+        predictions_path.write_text(
+            json.dumps(
+                {
+                    "instance_id": task.instance_id,
+                    "n_attempt": 1,
+                    "model_patch": patch_text,
+                    "agent": "recursive-intelligence",
+                    "model": f"recursive-intelligence/{mode}",
+                    "task_metadata": {"benchmark": task.benchmark},
+                    "success": True,
+                    "error": None,
+                }
+            )
+            + "\n"
+        )
+
+        command = [
+            *self._runner_command,
+            "--predictions-path",
+            str(predictions_path),
+            "--dataset",
+            self.dataset_name,
+            "--split",
+            self.split,
+            "--n-concurrent",
+            str(self.max_workers),
+            "--task-id",
+            task.instance_id,
+            "--timeout",
+            str(self.timeout_seconds),
+        ]
+        if self.config_path is not None:
+            command.extend(["--config-path", self.config_path])
+        completed = subprocess.run(command, cwd=str(eval_dir), capture_output=True, text=True)
+        harness_log_path.write_text((completed.stdout or "") + "\n" + (completed.stderr or ""))
+
+        summary_report_path = eval_dir / "report.json"
+        instance_dir = eval_dir / "eval_outputs" / task.instance_id / "attempt-1"
+        instance_report_path = instance_dir / "report.json"
+        test_output_path = instance_dir / "test_output.txt"
+        instance_log_path = instance_dir / "run_instance.log"
+        selected_log_path = (
+            test_output_path
+            if test_output_path.exists()
+            else instance_log_path
+            if instance_log_path.exists()
+            else harness_log_path
+        )
+
+        if instance_report_path.exists():
+            instance_report = json.loads(instance_report_path.read_text())
+            payload = instance_report.get(task.instance_id, {})
+            resolved = bool(payload.get("resolved", False))
+            patch_applied = bool(payload.get("patch_successfully_applied", False))
+            return PatchScore(
+                status="passed" if resolved else "failed",
+                patch_applied=patch_applied,
+                tests_passed=resolved,
+                exit_code=completed.returncode,
+                test_command=shlex.join(command),
+                log_path=str(selected_log_path),
+                report_path=str(instance_report_path),
+                error=None if completed.returncode == 0 else _command_error_text(completed),
+            )
+
+        if summary_report_path.exists():
+            summary_report = json.loads(summary_report_path.read_text())
+            attempt_report = next(iter(summary_report.values()), {})
+            unresolved_ids = attempt_report.get("not_applied_patch_empty_ids", []) + attempt_report.get(
+                "not_applied_patch_other_ids", []
+            )
+            patch_applied = not any(task.instance_id in entry for entry in unresolved_ids)
+        else:
+            patch_applied = False
+
+        status = "patch_failed" if not patch_applied else "evaluation_error"
+        return PatchScore(
+            status=status,
+            patch_applied=patch_applied,
+            tests_passed=False,
+            exit_code=completed.returncode,
+            test_command=shlex.join(command),
+            log_path=str(selected_log_path),
+            error=_command_error_text(completed)
+            or "FeatureBench evaluation did not produce an instance report.",
+        )
+
+    def _resolve_runner_command(self) -> list[str]:
+        if importlib.util.find_spec("featurebench") is not None:
+            return [self.python_executable, "-m", "featurebench.harness.run_evaluation"]
+        fb_binary = shutil.which("fb")
+        if fb_binary is not None:
+            return [fb_binary, "eval"]
+        return [self.python_executable, "-m", "featurebench.harness.run_evaluation"]
+
+    def _ensure_prerequisites(self) -> None:
+        if shutil.which("docker") is None:
+            raise RuntimeError("Docker is required for FeatureBench evaluation but was not found on PATH.")
+        featurebench_installed = importlib.util.find_spec("featurebench") is not None
+        fb_binary = shutil.which("fb")
+        if not featurebench_installed and fb_binary is None:
+            raise RuntimeError(
+                "FeatureBench evaluator is not available. Install the `featurebench` package or ensure `fb` is on PATH."
+            )
+
+
+OfficialHarnessEvaluator = SWEBenchHarnessEvaluator
+
+
+def _build_swebench_pro_sample(task: BenchmarkTask) -> dict[str, object]:
+    return {
+        "instance_id": task.instance_id,
+        "repo": task.repo,
+        "base_commit": task.base_commit,
+        "before_repo_set_cmd": task.extra.get("before_repo_set_cmd", ""),
+        "selected_test_files_to_run": json.dumps(task.extra.get("selected_test_files_to_run", task.test_directives)),
+        "fail_to_pass": json.dumps(task.fail_to_pass),
+        "pass_to_pass": json.dumps(task.pass_to_pass),
+    }
+
+
+def _detect_swebench_pro_patch_applied(stdout_log_path: Path, stderr_log_path: Path, output_json_path: Path) -> bool:
+    if output_json_path.exists():
+        return True
+
+    failure_markers = [
+        "patch does not apply",
+        "patch failed",
+        "error: corrupt patch",
+        "no valid patches in input",
+    ]
+    for path in (stderr_log_path, stdout_log_path):
+        if not path.exists():
+            continue
+        content = path.read_text(errors="ignore").lower()
+        if any(marker in content for marker in failure_markers):
+            return False
+    return False
 
 
 def _clone_repo(repo: str, base_commit: str, destination: Path) -> None:
@@ -376,14 +698,14 @@ def _is_env_assignment(token: str) -> bool:
     )
 
 
-def _describe_python_requirement(task: SWEBenchTask) -> str | None:
+def _describe_python_requirement(task: BenchmarkTask) -> str | None:
     requirement = resolve_python_requirement(task)
     if requirement is None:
         return None
     return requirement.describe()
 
 
-def _select_task_python(task: SWEBenchTask) -> dict[str, str | None]:
+def _select_task_python(task: BenchmarkTask) -> dict[str, str | None]:
     requirement = resolve_python_requirement(task)
     if requirement is None:
         return {
@@ -469,6 +791,12 @@ def _default_swebench_namespace() -> str:
     return "swebench"
 
 
+def _default_local_docker_platform() -> str | None:
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "linux/amd64"
+    return None
+
+
 def _official_run_id(instance_id: str, mode: str) -> str:
     sanitized = instance_id.replace("/", "-").replace(":", "-")
     return f"eval-{mode}-{sanitized[:40]}-{uuid.uuid4().hex[:8]}"
@@ -502,9 +830,12 @@ def _harness_entrypoint(python_executable: str) -> str:
 
 
 __all__ = [
+    "FeatureBenchEvaluator",
     "LocalPatchEvaluator",
     "OfficialHarnessEvaluator",
     "PatchEvaluator",
+    "SWEBenchHarnessEvaluator",
+    "SWEBenchProEvaluator",
     "_run_test_command",
     "_select_task_python",
 ]

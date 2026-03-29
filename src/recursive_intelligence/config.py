@@ -19,6 +19,7 @@ class RuntimeConfig:
     artifacts_dir: Path = field(init=False)
     benchmarks_dir: Path = field(init=False)
     datasets_dir: Path = field(init=False)
+    tools_dir: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -28,6 +29,7 @@ class RuntimeConfig:
         self.artifacts_dir = self.ri_dir / "runs"
         self.benchmarks_dir = self.ri_dir / "benchmarks"
         self.datasets_dir = self.ri_dir / "datasets"
+        self.tools_dir = self.ri_dir / "tools"
 
     def ensure_dirs(self) -> None:
         self.ri_dir.mkdir(exist_ok=True)
@@ -35,6 +37,7 @@ class RuntimeConfig:
         self.artifacts_dir.mkdir(exist_ok=True)
         self.benchmarks_dir.mkdir(exist_ok=True)
         self.datasets_dir.mkdir(exist_ok=True)
+        self.tools_dir.mkdir(exist_ok=True)
 
     @classmethod
     def from_cwd(cls) -> RuntimeConfig:

@@ -13,12 +13,18 @@ from pathlib import Path
 from typing import Callable
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord
-from recursive_intelligence.benchmarks.evaluation import OfficialHarnessEvaluator, PatchEvaluator
+from recursive_intelligence.benchmarks.evaluation import (
+    FeatureBenchEvaluator,
+    LocalPatchEvaluator,
+    OfficialHarnessEvaluator,
+    PatchEvaluator,
+    SWEBenchProEvaluator,
+)
 from recursive_intelligence.benchmarks.models import (
+    BenchmarkTask,
     BenchmarkRunConfig,
     BenchmarkModeResult,
     PatchScore,
-    SWEBenchTask,
     TaskBenchmarkResult,
 )
 from recursive_intelligence.benchmarks.reporting import build_suite_report
@@ -29,7 +35,7 @@ from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_t
 from recursive_intelligence.runtime.state_store import StateStore
 
 
-AdapterFactory = Callable[[str, SWEBenchTask], AgentAdapter]
+AdapterFactory = Callable[[str, BenchmarkTask], AgentAdapter]
 
 
 class BenchmarkRunner:
@@ -60,34 +66,82 @@ class BenchmarkRunner:
         self.test_timeout_seconds = test_timeout_seconds
         self.evaluation_namespace = evaluation_namespace
         self.max_concurrency = max(1, max_concurrency)
+        self._evaluator_cache: dict[tuple[str, str, str], PatchEvaluator] = {}
 
     async def run_swebench_suite(
         self,
-        tasks: list[SWEBenchTask],
+        tasks: list[BenchmarkTask],
         suite: str,
         dataset: str = DEFAULT_DATASET,
         split: str = DEFAULT_SPLIT,
         requested_limit: int | None = None,
+    ):
+        return await self.run_suite(
+            tasks,
+            benchmark="swebench",
+            suite=suite,
+            dataset=dataset,
+            split=split,
+            requested_limit=requested_limit,
+        )
+
+    async def run_manifest_suite(
+        self,
+        tasks: list[BenchmarkTask],
+        suite: str,
+        manifest_id: str,
+        manifest_path: str,
+        requested_limit: int | None = None,
+    ):
+        dataset_sources = sorted(
+            {
+                f"{task.benchmark}:{task.dataset_name or 'local'}:{task.dataset_split or 'local'}"
+                for task in tasks
+            }
+        )
+        return await self.run_suite(
+            tasks,
+            benchmark="manifest",
+            suite=suite,
+            dataset="mixed",
+            split="mixed",
+            requested_limit=requested_limit,
+            manifest_id=manifest_id,
+            manifest_path=manifest_path,
+            dataset_sources=dataset_sources,
+        )
+
+    async def run_suite(
+        self,
+        tasks: list[BenchmarkTask],
+        benchmark: str,
+        suite: str,
+        dataset: str,
+        split: str,
+        requested_limit: int | None = None,
+        manifest_id: str | None = None,
+        manifest_path: str | None = None,
+        dataset_sources: list[str] | None = None,
     ):
         self.config.ensure_dirs()
         run_id = _new_benchmark_id()
         run_dir = self.config.benchmarks_dir / run_id
         tasks_dir = run_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
-        evaluator = self.patch_evaluator or OfficialHarnessEvaluator(
-            dataset_name=dataset,
-            split=split,
-            timeout_seconds=self.test_timeout_seconds,
-            namespace=self.evaluation_namespace,
+        report_config = self._build_report_config(
+            tasks,
+            requested_limit=requested_limit,
+            manifest_id=manifest_id,
+            manifest_path=manifest_path,
+            dataset_sources=dataset_sources,
         )
-        report_config = self._build_report_config(evaluator, requested_limit)
         results: list[TaskBenchmarkResult | None] = [None] * len(tasks)
         semaphore = asyncio.Semaphore(self.max_concurrency)
         report_lock = asyncio.Lock()
 
-        async def _run_one(index: int, task: SWEBenchTask) -> None:
+        async def _run_one(index: int, task: BenchmarkTask) -> None:
             async with semaphore:
-                result = await self.run_task(run_id, task, evaluator)
+                result = await self.run_task(run_id, task)
             task_path = tasks_dir / f"{task.instance_id}.json"
             task_path.write_text(json.dumps(result.to_dict(), indent=2))
             async with report_lock:
@@ -95,7 +149,7 @@ class BenchmarkRunner:
                 partial_results = [item for item in results if item is not None]
                 report = build_suite_report(
                     run_id,
-                    "swebench",
+                    benchmark,
                     suite,
                     dataset,
                     split,
@@ -108,7 +162,7 @@ class BenchmarkRunner:
         final_results = [item for item in results if item is not None]
         final_report = build_suite_report(
             run_id,
-            "swebench",
+            benchmark,
             suite,
             dataset,
             split,
@@ -121,17 +175,20 @@ class BenchmarkRunner:
     async def run_task(
         self,
         benchmark_run_id: str,
-        task: SWEBenchTask,
-        evaluator: PatchEvaluator,
+        task: BenchmarkTask,
     ) -> TaskBenchmarkResult:
         task_dir = self.config.benchmarks_dir / benchmark_run_id / "artifacts" / task.instance_id
         task_dir.mkdir(parents=True, exist_ok=True)
+        evaluator = self._evaluator_for_task(task)
 
         baseline = await self._run_mode(task, task_dir, mode="baseline", evaluator=evaluator)
         recursive = await self._run_mode(task, task_dir, mode="recursive", evaluator=evaluator)
         comparison = compare_modes(baseline, recursive)
 
         result = TaskBenchmarkResult(
+            benchmark=task.benchmark,
+            dataset_name=task.dataset_name,
+            dataset_split=task.dataset_split,
             instance_id=task.instance_id,
             repo=task.repo,
             version=task.version,
@@ -145,7 +202,7 @@ class BenchmarkRunner:
 
     async def _run_mode(
         self,
-        task: SWEBenchTask,
+        task: BenchmarkTask,
         task_dir: Path,
         mode: str,
         evaluator: PatchEvaluator,
@@ -259,7 +316,7 @@ class BenchmarkRunner:
 
     def _score_patch(
         self,
-        task: SWEBenchTask,
+        task: BenchmarkTask,
         patch_text: str,
         task_dir: Path,
         mode: str,
@@ -267,7 +324,7 @@ class BenchmarkRunner:
     ) -> PatchScore:
         return evaluator.score_patch(task, patch_text, task_dir, mode)
 
-    def _make_adapter(self, mode: str, task: SWEBenchTask) -> AgentAdapter:
+    def _make_adapter(self, mode: str, task: BenchmarkTask) -> AgentAdapter:
         if self.adapter_factory is not None:
             return self.adapter_factory(mode, task)
         from recursive_intelligence.adapters.claude.adapter import ClaudeAdapter
@@ -276,17 +333,75 @@ class BenchmarkRunner:
             return ClaudeAdapter(root_model=self.root_model, child_model=self.root_model)
         return ClaudeAdapter(root_model=self.root_model, child_model=self.child_model)
 
+    def _evaluator_for_task(self, task: BenchmarkTask) -> PatchEvaluator:
+        if self.patch_evaluator is not None:
+            return self.patch_evaluator
+
+        backend = task.evaluation_backend or ("local_patch" if not task.dataset_name else task.benchmark)
+        if backend == "local_patch":
+            key = ("local_patch", "", "")
+            if key not in self._evaluator_cache:
+                self._evaluator_cache[key] = LocalPatchEvaluator(timeout_seconds=self.test_timeout_seconds)
+            return self._evaluator_cache[key]
+
+        dataset_name = task.dataset_name or DEFAULT_DATASET
+        dataset_split = task.dataset_split or DEFAULT_SPLIT
+        key = (backend, dataset_name, dataset_split)
+        if key not in self._evaluator_cache:
+            if task.benchmark == "swebench_pro":
+                self._evaluator_cache[key] = SWEBenchProEvaluator(
+                    dataset_name=dataset_name,
+                    split=dataset_split,
+                    timeout_seconds=self.test_timeout_seconds,
+                    repo_path=self.config.tools_dir / "SWE-bench_Pro-os",
+                )
+            elif task.benchmark == "featurebench":
+                self._evaluator_cache[key] = FeatureBenchEvaluator(
+                    dataset_name=dataset_name,
+                    split=dataset_split,
+                    timeout_seconds=self.test_timeout_seconds,
+                    max_workers=self.max_concurrency,
+                )
+            else:
+                self._evaluator_cache[key] = OfficialHarnessEvaluator(
+                    dataset_name=dataset_name,
+                    split=dataset_split,
+                    timeout_seconds=self.test_timeout_seconds,
+                    namespace=self.evaluation_namespace,
+                )
+        return self._evaluator_cache[key]
+
     def _build_report_config(
         self,
-        evaluator: PatchEvaluator,
+        tasks: list[BenchmarkTask],
         requested_limit: int | None,
+        manifest_id: str | None = None,
+        manifest_path: str | None = None,
+        dataset_sources: list[str] | None = None,
     ) -> BenchmarkRunConfig:
-        if isinstance(evaluator, OfficialHarnessEvaluator):
-            evaluation_backend = "official_harness"
-            evaluation_namespace = evaluator.namespace
+        if self.patch_evaluator is not None:
+            evaluation_backend = getattr(self.patch_evaluator, "backend_name", "local_patch")
+            evaluation_namespace = (
+                self.patch_evaluator.namespace
+                if isinstance(self.patch_evaluator, OfficialHarnessEvaluator)
+                else self.evaluation_namespace
+            )
         else:
-            evaluation_backend = "local_patch"
+            backends = {
+                task.evaluation_backend or ("local_patch" if not task.dataset_name else task.benchmark)
+                for task in tasks
+            }
+            if not backends:
+                evaluation_backend = "unknown"
+            else:
+                evaluation_backend = next(iter(backends)) if len(backends) == 1 else "mixed"
             evaluation_namespace = self.evaluation_namespace
+        sources = dataset_sources or sorted(
+            {
+                f"{task.benchmark}:{task.dataset_name or 'local'}:{task.dataset_split or 'local'}"
+                for task in tasks
+            }
+        )
         return BenchmarkRunConfig(
             fallback_model=self.model,
             root_model=self.root_model,
@@ -296,6 +411,9 @@ class BenchmarkRunner:
             requested_limit=requested_limit,
             max_concurrency=self.max_concurrency,
             test_timeout_seconds=self.test_timeout_seconds,
+            manifest_id=manifest_id,
+            manifest_path=manifest_path,
+            dataset_sources=sources,
         )
 
 

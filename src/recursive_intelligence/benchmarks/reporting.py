@@ -97,6 +97,9 @@ def _build_comparison_aggregate(tasks: list[TaskBenchmarkResult]) -> ComparisonA
 
 def _write_csv(report: dict, path: Path) -> None:
     fieldnames = [
+        "benchmark",
+        "dataset_name",
+        "dataset_split",
         "instance_id",
         "repo",
         "version",
@@ -110,6 +113,9 @@ def _write_csv(report: dict, path: Path) -> None:
         "config_requested_limit",
         "config_max_concurrency",
         "config_test_timeout_seconds",
+        "config_manifest_id",
+        "config_manifest_path",
+        "config_dataset_sources",
         "baseline_solved",
         "baseline_runtime_status",
         "baseline_score_status",
@@ -142,6 +148,9 @@ def _write_csv(report: dict, path: Path) -> None:
             recursive = task["recursive"]
             writer.writerow(
                 {
+                    "benchmark": task.get("benchmark"),
+                    "dataset_name": task.get("dataset_name"),
+                    "dataset_split": task.get("dataset_split"),
                     "instance_id": task["instance_id"],
                     "repo": task["repo"],
                     "version": task["version"],
@@ -155,6 +164,9 @@ def _write_csv(report: dict, path: Path) -> None:
                     "config_requested_limit": config.get("requested_limit"),
                     "config_max_concurrency": config.get("max_concurrency"),
                     "config_test_timeout_seconds": config.get("test_timeout_seconds"),
+                    "config_manifest_id": config.get("manifest_id"),
+                    "config_manifest_path": config.get("manifest_path"),
+                    "config_dataset_sources": json.dumps(config.get("dataset_sources", [])),
                     "baseline_solved": baseline["solved"],
                     "baseline_runtime_status": baseline["runtime_status"],
                     "baseline_score_status": baseline["score"]["status"],

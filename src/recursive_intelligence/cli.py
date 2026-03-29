@@ -439,6 +439,135 @@ def benchmark_swebench(
         sys.exit(1)
 
 
+@benchmark.command("manifest")
+@click.argument("manifest_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--limit", type=int, default=None, help="Optional task limit")
+@click.option("--refresh", is_flag=True, help="Refresh cached datasets while resolving the manifest")
+@click.option("--keep-task-dirs", is_flag=True, help="Keep cloned task directories after the run")
+@click.option("--model", default="claude-opus-4-6", help="Fallback model for both root and child nodes")
+@click.option("--root-model", default=None, help="Claude model for baseline and recursive root nodes")
+@click.option("--child-model", default=None, help="Claude model for recursive child nodes")
+@click.option("--max-concurrency", type=int, default=2, show_default=True, help="Max concurrent benchmark tasks")
+@click.option(
+    "--namespace",
+    default=None,
+    help="Docker image namespace override for official harness-backed tasks",
+)
+@click.pass_context
+def benchmark_manifest(
+    ctx: click.Context,
+    manifest_path: Path,
+    limit: int | None,
+    refresh: bool,
+    keep_task_dirs: bool,
+    model: str,
+    root_model: str | None,
+    child_model: str | None,
+    max_concurrency: int,
+    namespace: str | None,
+) -> None:
+    """Benchmark a frozen manifest that may span multiple datasets."""
+    from recursive_intelligence.benchmarks import (
+        BenchmarkRunner,
+        load_benchmark_manifest,
+        resolve_manifest_tasks,
+    )
+
+    config: RuntimeConfig = ctx.obj["config"]
+
+    try:
+        manifest = load_benchmark_manifest(manifest_path)
+        tasks = resolve_manifest_tasks(manifest, config.datasets_dir, refresh=refresh)
+        if limit is not None:
+            tasks = tasks[:limit]
+
+        runner = BenchmarkRunner(
+            config,
+            model=model,
+            root_model=root_model,
+            child_model=child_model,
+            keep_task_dirs=keep_task_dirs,
+            evaluation_namespace=namespace,
+            max_concurrency=max_concurrency,
+        )
+        report = asyncio.run(
+            runner.run_manifest_suite(
+                tasks,
+                suite=manifest.manifest_id,
+                manifest_id=manifest.manifest_id,
+                manifest_path=str(manifest_path.resolve()),
+                requested_limit=limit,
+            )
+        )
+
+        click.echo(f"{INDENT}{_dim('benchmark')} {report.run_id}")
+        click.echo(f"{INDENT}{_dim('suite')}      {manifest.manifest_id}")
+        click.echo(f"{INDENT}{_dim('tasks')}      {report.task_count}")
+        click.echo(
+            f"{INDENT}{_dim('baseline')}   "
+            f"{report.baseline.solved}/{report.baseline.eligible} solved"
+            f"{_format_unsupported(report.baseline.unsupported)}"
+        )
+        click.echo(
+            f"{INDENT}{_dim('recursive')}  "
+            f"{report.recursive.solved}/{report.recursive.eligible} solved"
+            f"{_format_unsupported(report.recursive.unsupported)}"
+        )
+        click.echo(f"{INDENT}{_dim('report')}     {config.benchmarks_dir / report.run_id / 'report.json'}")
+    except Exception as e:
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
+        sys.exit(1)
+
+
+@benchmark.command("build-manifest")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output path for the generated manifest",
+)
+@click.option("--manifest-id", default="recursive-hard-v1", show_default=True, help="Manifest identifier")
+@click.option("--title", default="Recursive Hard v1", show_default=True, help="Manifest title")
+@click.option("--refresh", is_flag=True, help="Refresh cached datasets while building the manifest")
+@click.option("--swebench-pro-count", type=int, default=20, show_default=True, help="Tasks to select from SWE-Bench Pro")
+@click.option("--featurebench-count", type=int, default=10, show_default=True, help="Tasks to select from FeatureBench")
+@click.option("--repo-cap", type=int, default=2, show_default=True, help="Max tasks per repo within each source benchmark")
+@click.pass_context
+def benchmark_build_manifest(
+    ctx: click.Context,
+    output: Path | None,
+    manifest_id: str,
+    title: str,
+    refresh: bool,
+    swebench_pro_count: int,
+    featurebench_count: int,
+    repo_cap: int,
+) -> None:
+    """Build a deterministic recursive-hard manifest from supported datasets."""
+    from recursive_intelligence.benchmarks import build_recursive_hard_manifest
+
+    config: RuntimeConfig = ctx.obj["config"]
+    output_path = output or (config.repo_root / "benchmarks" / "manifests" / f"{manifest_id}.json")
+
+    try:
+        manifest = build_recursive_hard_manifest(
+            config.datasets_dir,
+            output_path=output_path,
+            manifest_id=manifest_id,
+            title=title,
+            swebench_pro_count=swebench_pro_count,
+            featurebench_count=featurebench_count,
+            repo_cap=repo_cap,
+            refresh=refresh,
+        )
+        click.echo(f"{INDENT}{_dim('manifest')}  {manifest.manifest_id}")
+        click.echo(f"{INDENT}{_dim('tasks')}      {len(manifest.tasks)}")
+        click.echo(f"{INDENT}{_dim('output')}     {output_path}")
+    except Exception as e:
+        click.echo(f"\n{INDENT}{_red('error')} {e}", err=True)
+        sys.exit(1)
+
+
 @main.command("export-report")
 @click.argument("run_id")
 @click.option(
