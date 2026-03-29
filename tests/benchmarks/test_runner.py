@@ -292,7 +292,6 @@ def test_official_harness_evaluator_reads_instance_report(
     assert score.report_path is not None
     assert score.log_path is not None
 
-
 def test_swebench_pro_evaluator_reads_eval_results(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -400,7 +399,6 @@ def test_featurebench_evaluator_reads_instance_report(
     assert score.report_path is not None
     assert score.log_path is not None
     assert "featurebench.harness.run_evaluation" in score.test_command
-
 
 def test_benchmark_runner_configures_distinct_root_and_child_models(tmp_path: Path):
     config = RuntimeConfig(repo_root=tmp_path)
@@ -526,7 +524,6 @@ async def test_benchmark_runner_persists_manifest_metadata(tmp_path: Path, monke
         "featurebench:LiberCoders/FeatureBench:full",
         "swebench_pro:ScaleAI/SWE-bench_Pro:test",
     ]
-
 
 def test_report_excludes_unsupported_tasks_from_solve_rate():
     unsupported_score = PatchScore(
