@@ -9,8 +9,8 @@ from recursive_intelligence.adapters.base import CostRecord
 
 
 @dataclass
-class SWEBenchTask:
-    """Normalized SWE-bench task metadata."""
+class BenchmarkTask:
+    """Normalized benchmark task metadata."""
 
     instance_id: str
     repo: str
@@ -30,10 +30,17 @@ class SWEBenchTask:
     test_directives: list[str] = field(default_factory=list)
     complexity_score: int = 0
     test_command: str | None = None
+    benchmark: str = "swebench"
+    dataset_name: str | None = None
+    dataset_split: str | None = None
+    evaluation_backend: str | None = None
+    manifest_id: str | None = None
+    selection_scores: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def build_prompt(self) -> str:
         prompt = (
-            f"Resolve SWE-bench instance {self.instance_id} in repo {self.repo}.\n\n"
+            f"Resolve benchmark instance {self.instance_id} in repo {self.repo}.\n\n"
             f"Problem statement:\n{self.problem_statement.strip()}\n"
         )
         if self.hints_text.strip():
@@ -48,6 +55,9 @@ class SWEBenchTask:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+SWEBenchTask = BenchmarkTask
 
 
 @dataclass
@@ -99,6 +109,9 @@ class BenchmarkModeResult:
 class TaskBenchmarkResult:
     """Flat-vs-recursive comparison for one benchmark task."""
 
+    benchmark: str
+    dataset_name: str | None
+    dataset_split: str | None
     instance_id: str
     repo: str
     version: str
@@ -146,6 +159,26 @@ class ComparisonAggregate:
 
 
 @dataclass
+class BenchmarkRunConfig:
+    """Persisted benchmark configuration for reproducibility."""
+
+    fallback_model: str | None = None
+    root_model: str | None = None
+    child_model: str | None = None
+    evaluation_backend: str = "official_harness"
+    evaluation_namespace: str | None = None
+    requested_limit: int | None = None
+    max_concurrency: int = 1
+    test_timeout_seconds: int = 1800
+    manifest_id: str | None = None
+    manifest_path: str | None = None
+    dataset_sources: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class BenchmarkSuiteReport:
     """Full persisted report for a benchmark suite run."""
 
@@ -160,6 +193,7 @@ class BenchmarkSuiteReport:
     recursive: ModeAggregate
     comparison: ComparisonAggregate
     tasks: list[TaskBenchmarkResult]
+    config: BenchmarkRunConfig = field(default_factory=BenchmarkRunConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
