@@ -1,5 +1,6 @@
 """Tests for the SQLite state store."""
 
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -38,6 +39,34 @@ class TestRuns:
         store.set_root_node(run.run_id, node.node_id)
         fetched = store.get_run(run.run_id)
         assert fetched.root_node_id == node.node_id
+
+    def test_create_run_migrates_legacy_runs_table(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                repo_root TEXT NOT NULL,
+                task TEXT NOT NULL,
+                root_node_id TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                pass_count INTEGER NOT NULL DEFAULT 1,
+                persistent INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        store = StateStore(db_path)
+        try:
+            run = store.create_run("/tmp/repo", "task", test_command="pytest")
+            fetched = store.get_run(run.run_id)
+            assert fetched is not None
+            assert fetched.test_command == "pytest"
+        finally:
+            store.close()
 
 
 class TestNodes:
