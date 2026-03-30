@@ -149,6 +149,53 @@ Implement the changes, commit, and return:
 """
 
 
+def verification_retry_prompt(
+    task_spec: str,
+    test_command: str,
+    test_output: str,
+    has_children: bool = False,
+) -> str:
+    """Re-plan after test verification failed."""
+
+    if has_children:
+        options = """\
+## Respond with ONE of:
+
+Fix it yourself:
+{{"action": "solve_directly", "rationale": "..."}}
+
+Route fixes to the responsible children:
+{{
+  "action": "route_to_children",
+  "rationale": "...",
+  "routes": [{{"child_node_id": "...", "domain_name": "...", "task_spec": "describe what the child should fix"}}]
+}}"""
+    else:
+        options = """\
+## Respond with:
+{{"action": "solve_directly", "rationale": "..."}}"""
+
+    return f"""\
+Tests failed after implementation. Fix the failures and try again.
+
+## Original task
+{task_spec}
+
+## Test command
+{test_command}
+
+## Test output (truncated)
+```
+{test_output}
+```
+
+Read the failing test output carefully. Identify exactly what went wrong and fix it.
+Commit your changes when done.
+
+{options}
+"""
+
+
 def conflict_resolution_prompt(child_id: str, conflict_files: list[str], conflict_diff: str) -> str:
     """Resolve merge conflicts from a child's cherry-pick."""
 

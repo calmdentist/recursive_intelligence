@@ -125,8 +125,8 @@ class NodeFSM:
         else:
             raise ValueError(f"Unknown plan action: {decision.action}")
 
-    def finish_execution(self, result: ExecutionResult) -> NodeRecord:
-        """Finish execution and transition to completed or appropriate state."""
+    def finish_execution(self, result: ExecutionResult, verify: bool = False) -> NodeRecord:
+        """Finish execution and transition to completed, verifying, or failed."""
         data: dict[str, Any] = {"status": result.status, "summary": result.summary}
         if result.commit_sha:
             data["commit_sha"] = result.commit_sha
@@ -142,7 +142,8 @@ class NodeFSM:
                 }
             return self.store.transition_node(self.node_id, NodeState.FAILED, data)
 
-        return self.store.transition_node(self.node_id, NodeState.COMPLETED, data)
+        next_state = NodeState.VERIFYING if verify else NodeState.COMPLETED
+        return self.store.transition_node(self.node_id, next_state, data)
 
     def apply_review_verdict(self, verdict: ReviewVerdict) -> NodeRecord:
         """Apply a review verdict. May loop back to waiting if revising."""
@@ -189,14 +190,35 @@ class NodeFSM:
 
         return self.node
 
-    def finish_merge(self, commit_sha: str) -> NodeRecord:
+    def finish_merge(self, commit_sha: str, verify: bool = False) -> NodeRecord:
         data = {"final_commit_sha": commit_sha}
-        return self.store.transition_node(self.node_id, NodeState.COMPLETED, data)
+        next_state = NodeState.VERIFYING if verify else NodeState.COMPLETED
+        return self.store.transition_node(self.node_id, next_state, data)
 
-    def pause_after_merge(self, commit_sha: str) -> NodeRecord:
-        """Pause after merge instead of completing — for persistent multi-pass runs."""
+    def pause_after_merge(self, commit_sha: str, verify: bool = False) -> NodeRecord:
+        """Pause after merge instead of completing — for persistent multi-pass runs.
+
+        If verify=True, go to VERIFYING first (the orchestrator will pause
+        after verification passes).
+        """
+        if verify:
+            data = {"merge_commit_sha": commit_sha}
+            return self.store.transition_node(self.node_id, NodeState.VERIFYING, data)
         data = {"merge_commit_sha": commit_sha}
         return self.store.transition_node(self.node_id, NodeState.PAUSED, data)
+
+    def finish_verify_pass(self, persistent_root: bool = False) -> NodeRecord:
+        """Verification passed — complete or pause."""
+        data = {"verification": "passed"}
+        next_state = NodeState.PAUSED if persistent_root else NodeState.COMPLETED
+        return self.store.transition_node(self.node_id, next_state, data)
+
+    def finish_verify_fail(self, retries_remaining: int) -> NodeRecord:
+        """Verification failed — retry via re-planning or fail permanently."""
+        data = {"verification": "failed", "retries_remaining": retries_remaining}
+        if retries_remaining > 0:
+            return self.store.transition_node(self.node_id, NodeState.PLANNING, data)
+        return self.store.transition_node(self.node_id, NodeState.FAILED, data)
 
     def resume_from_pause(self, user_input: str) -> NodeRecord:
         """Resume a paused node for a new pass."""

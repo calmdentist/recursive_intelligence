@@ -28,7 +28,7 @@ from recursive_intelligence.benchmarks.models import (
     TaskBenchmarkResult,
 )
 from recursive_intelligence.benchmarks.reporting import build_suite_report
-from recursive_intelligence.benchmarks.swebench import DEFAULT_DATASET, DEFAULT_SPLIT
+from recursive_intelligence.benchmarks.swebench import DEFAULT_DATASET, DEFAULT_SPLIT, resolve_test_command
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.runtime.baseline import BaselineRunner
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
@@ -251,7 +251,14 @@ class BenchmarkRunner:
                 patch_path.write_text(patch_text)
             else:
                 orchestrator = Orchestrator(runtime_config, adapter)
-                run_id = await orchestrator.start_run(task.build_prompt())
+                try:
+                    test_cmd = resolve_test_command(task)
+                except (ValueError, KeyError):
+                    test_cmd = task.test_command
+                run_id = await orchestrator.start_run(
+                    task.build_prompt(),
+                    test_command=test_cmd,
+                )
                 duration_ms = int((time.perf_counter() - start) * 1000)
                 summary = _summarize_recursive_run(runtime_config, run_id, task.base_commit)
                 runtime_status = summary["status"]

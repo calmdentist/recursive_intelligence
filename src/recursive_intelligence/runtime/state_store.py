@@ -19,6 +19,7 @@ class NodeState(str, Enum):
     WAITING_ON_CHILDREN = "waiting_on_children"
     REVIEWING_CHILDREN = "reviewing_children"
     MERGING = "merging"
+    VERIFYING = "verifying"
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -45,6 +46,7 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     },
     NodeState.EXECUTING: {
         NodeState.COMPLETED,
+        NodeState.VERIFYING,
         NodeState.PAUSED,
         NodeState.WAITING_ON_CHILDREN,
         NodeState.FAILED,
@@ -63,8 +65,16 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     },
     NodeState.MERGING: {
         NodeState.COMPLETED,
+        NodeState.VERIFYING,
         NodeState.PAUSED,  # multi-pass: pause after merge
         NodeState.FAILED,
+        NodeState.CANCELLED,
+    },
+    NodeState.VERIFYING: {
+        NodeState.COMPLETED,
+        NodeState.PLANNING,  # retry on test failure
+        NodeState.PAUSED,    # persistent root passes verification
+        NodeState.FAILED,    # retries exhausted
         NodeState.CANCELLED,
     },
     NodeState.PAUSED: {
@@ -115,6 +125,7 @@ class RunRecord:
     status: str  # "running", "paused", "completed", "failed"
     pass_count: int = 1
     persistent: bool = False
+    test_command: str | None = None
 
 
 @dataclass
@@ -152,7 +163,8 @@ class StateStore:
                 finished_at TEXT,
                 status TEXT NOT NULL DEFAULT 'running',
                 pass_count INTEGER NOT NULL DEFAULT 1,
-                persistent INTEGER NOT NULL DEFAULT 0
+                persistent INTEGER NOT NULL DEFAULT 0,
+                test_command TEXT
             );
 
             CREATE TABLE IF NOT EXISTS nodes (
@@ -209,25 +221,36 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS idx_domain_parent ON domain_registry(parent_node_id);
             CREATE INDEX IF NOT EXISTS idx_domain_child ON domain_registry(child_node_id);
         """)
+        self._ensure_column("runs", "test_command", "TEXT")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         self._conn.close()
 
     # --- Runs ---
 
-    def create_run(self, repo_root: str, task: str, persistent: bool = False) -> RunRecord:
+    def create_run(
+        self, repo_root: str, task: str, persistent: bool = False, test_command: str | None = None,
+    ) -> RunRecord:
         run_id = _new_id("run")
         now = _now()
         self._conn.execute(
-            "INSERT INTO runs (run_id, repo_root, task, created_at, status, persistent) VALUES (?, ?, ?, ?, 'running', ?)",
-            (run_id, repo_root, task, now, 1 if persistent else 0),
+            "INSERT INTO runs (run_id, repo_root, task, created_at, status, persistent, test_command) VALUES (?, ?, ?, ?, 'running', ?, ?)",
+            (run_id, repo_root, task, now, 1 if persistent else 0, test_command),
         )
         self._conn.commit()
         return RunRecord(
             run_id=run_id, repo_root=repo_root, task=task, root_node_id=None,
             created_at=now, finished_at=None, status="running",
-            pass_count=1, persistent=persistent,
+            pass_count=1, persistent=persistent, test_command=test_command,
         )
 
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -390,6 +413,13 @@ class StateStore:
         )
         self._conn.commit()
 
+    def session_exists(self, session_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row is not None
+
     def finish_session(self, session_id: str, transcript_path: str | None = None, cost_json: str | None = None) -> None:
         now = _now()
         self._conn.execute(
@@ -487,11 +517,18 @@ def _row_to_node(row: sqlite3.Row) -> NodeRecord:
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    # test_command column may not exist in older databases
+    test_command = None
+    try:
+        test_command = row["test_command"]
+    except (IndexError, KeyError):
+        pass
     return RunRecord(
         run_id=row["run_id"], repo_root=row["repo_root"], task=row["task"],
         root_node_id=row["root_node_id"], created_at=row["created_at"],
         finished_at=row["finished_at"], status=row["status"],
         pass_count=row["pass_count"], persistent=bool(row["persistent"]),
+        test_command=test_command,
     )
 
 

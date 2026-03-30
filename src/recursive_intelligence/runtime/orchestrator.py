@@ -42,6 +42,7 @@ from recursive_intelligence.adapters.claude.prompts import (
     routing_prompt,
     reactivation_prompt,
     conflict_resolution_prompt,
+    verification_retry_prompt,
 )
 from recursive_intelligence.runtime.node_fsm import (
     ChildSpec,
@@ -52,6 +53,7 @@ from recursive_intelligence.runtime.node_fsm import (
     RouteSpec,
 )
 from recursive_intelligence.runtime.state_store import NodeState, StateStore
+from recursive_intelligence.test_commands import run_test_command
 
 log = logging.getLogger(__name__)
 
@@ -89,16 +91,20 @@ class Orchestrator:
 
     # --- Run lifecycle ---
 
-    async def start_run(self, task: str, persistent: bool = False) -> str:
+    async def start_run(
+        self, task: str, persistent: bool = False, test_command: str | None = None,
+    ) -> str:
         """Start a new run. Returns the run_id.
 
         If persistent=True, the run pauses after the first pass instead
         of completing, allowing follow-up via continue_run().
+        If test_command is provided, nodes will verify their work by running
+        this command after execution/merge and retry on failure.
         """
         ensure_clean_repo(self.config.repo_root)
         store = self._ensure_store()
 
-        run = store.create_run(str(self.config.repo_root), task, persistent=persistent)
+        run = store.create_run(str(self.config.repo_root), task, persistent=persistent, test_command=test_command)
         log.info("Created run %s (persistent=%s)", run.run_id, persistent)
 
         b_name = branch_name(run.run_id, "root", task)
@@ -179,6 +185,7 @@ class Orchestrator:
         resumable = [
             NodeState.QUEUED, NodeState.PLANNING, NodeState.EXECUTING,
             NodeState.WAITING_ON_CHILDREN, NodeState.REVIEWING_CHILDREN,
+            NodeState.VERIFYING,
             NodeState.MERGING,
         ]
         node_ids = []
@@ -188,6 +195,16 @@ class Orchestrator:
 
         if node_ids:
             await asyncio.gather(*[self._drive_node(nid) for nid in node_ids])
+
+        root = store.get_node(run.root_node_id)
+        if root is None:
+            return
+        if root.state == NodeState.PAUSED:
+            store.pause_run(run_id)
+        elif root.state == NodeState.COMPLETED:
+            store.finish_run(run_id, "completed")
+        elif root.state.is_terminal:
+            store.finish_run(run_id, "failed")
 
     # --- Node driving ---
 
@@ -217,6 +234,8 @@ class Orchestrator:
                 await self._run_review(fsm)
             elif node.state == NodeState.MERGING:
                 await self._run_merge(fsm)
+            elif node.state == NodeState.VERIFYING:
+                await self._run_verify(fsm)
             else:
                 break
 
@@ -232,10 +251,15 @@ class Orchestrator:
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
         run = store.get_run(node.run_id)
 
+        # Check if this is a verification retry (re-planning after test failure)
+        is_verify_retry = self._is_verification_retry(node)
+
         # Check if this is a routing pass (multi-pass follow-up on root or parent)
         is_routing = run and run.pass_count > 1 and len(store.get_children(node.node_id)) > 0
 
-        if is_routing:
+        if is_verify_retry:
+            prompt = self._build_verify_retry_prompt(node, run)
+        elif is_routing:
             prompt = self._build_routing_prompt(node, run)
         else:
             prompt = planning_prompt(node.task_spec)
@@ -243,7 +267,7 @@ class Orchestrator:
         try:
             result = await self.adapter.run(
                 prompt=prompt, worktree=worktree, mode="plan",
-                resume_session_id=node.session_id if is_routing else None,
+                resume_session_id=node.session_id if (is_routing or is_verify_retry) else None,
                 on_message=self._stream_callback_for(node.node_id),
                 is_root=self._is_root(node.node_id),
             )
@@ -252,8 +276,10 @@ class Orchestrator:
             fsm.fail(str(e), failure_type="adapter_error")
             return
 
+        previous_session_id = node.session_id
         store.update_node(node.node_id, session_id=result.session_id)
-        store.create_session(result.session_id, node.node_id, self.adapter.name)
+        if result.session_id != previous_session_id or not store.session_exists(result.session_id):
+            store.create_session(result.session_id, node.node_id, self.adapter.name)
         store.finish_session(result.session_id)
 
         store.append_event(node.run_id, node.node_id, "plan_result", {
@@ -389,8 +415,10 @@ class Orchestrator:
         if execution.changed_files:
             self._update_domain_from_changed_files(node, execution.changed_files)
 
-        log.info("Node %s execution: %s", node.node_id, execution.status)
-        fsm.finish_execution(execution)
+        run = store.get_run(node.run_id)
+        should_verify = self._should_verify(node, run)
+        log.info("Node %s execution: %s (verify=%s)", node.node_id, execution.status, should_verify)
+        fsm.finish_execution(execution, verify=should_verify)
 
     def _update_domain_from_changed_files(self, node, changed_files: list[str]) -> None:
         """Auto-update domain file_patterns from actual files touched."""
@@ -597,12 +625,8 @@ class Orchestrator:
                 )
             except Exception as e:
                 log.error("Review failed for %s: %s", child.node_id, e)
-                verdict = ReviewVerdict(
-                    child_id=child.node_id, verdict="accept",
-                    reason=f"Review error, auto-accepting: {e}",
-                )
-                fsm.apply_review_verdict(verdict)
-                continue
+                fsm.fail(str(e), failure_type="review_error")
+                return
 
             store.update_node(node.node_id, session_id=result.session_id)
             store.append_event(node.run_id, node.node_id, "review_result", {
@@ -735,12 +759,14 @@ class Orchestrator:
         final_sha = get_head_sha(parent_wt)
         # Only the root node pauses in persistent mode — children always complete
         is_root = run and run.root_node_id == node.node_id
+        should_verify = self._should_verify(node, run)
         if is_root and run.persistent:
-            fsm.pause_after_merge(final_sha)
-            log.info("Node %s merged and paused at %s", node.node_id, final_sha[:8])
+            fsm.pause_after_merge(final_sha, verify=should_verify)
+            log.info("Node %s merged and %s at %s", node.node_id,
+                     "verifying" if should_verify else "paused", final_sha[:8])
         else:
-            fsm.finish_merge(final_sha)
-            log.info("Node %s merged at %s", node.node_id, final_sha[:8])
+            fsm.finish_merge(final_sha, verify=should_verify)
+            log.info("Node %s merged at %s (verify=%s)", node.node_id, final_sha[:8], should_verify)
 
     # --- Conflict resolution ---
 
@@ -826,6 +852,101 @@ class Orchestrator:
         except Exception as e:
             log.error("Failed to finalize cherry-pick for %s: %s", child_id, e)
             return False
+
+    # --- Verification ---
+
+    async def _run_verify(self, fsm: NodeFSM) -> None:
+        """Run the test command against the node's worktree and handle results."""
+        store = self._ensure_store()
+        node = fsm.node
+        run = store.get_run(node.run_id)
+        should_verify = self._should_verify(node, run)
+
+        if not run or not run.test_command or not should_verify:
+            log.info("Node %s: no test command, skipping verification", node.node_id)
+            is_root = run and run.root_node_id == node.node_id
+            persistent_root = is_root and run.persistent if run else False
+            fsm.finish_verify_pass(persistent_root=persistent_root)
+            return
+
+        worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
+        test_command = run.test_command
+
+        log.info("Node %s: running verification: %s", node.node_id, test_command)
+
+        try:
+            completed = await asyncio.to_thread(
+                _run_test_in_worktree, test_command, worktree, timeout=self.config.max_verify_retries * 600 + 600,
+            )
+            passed = completed.returncode == 0
+            output = _truncate_test_output(completed.stdout or "", completed.stderr or "")
+        except subprocess.TimeoutExpired:
+            passed = False
+            output = "Test command timed out"
+        except Exception as e:
+            log.error("Verification command failed for %s: %s", node.node_id, e)
+            passed = False
+            output = str(e)
+
+        # Count how many verification attempts this node has had
+        events = store.get_node_events(node.node_id)
+        verify_count = sum(1 for e in events if e.event_type == "verification_result")
+
+        store.append_event(node.run_id, node.node_id, "verification_result", {
+            "passed": passed,
+            "test_command": test_command,
+            "output": output[:8000],
+            "attempt": verify_count + 1,
+        })
+
+        if passed:
+            log.info("Node %s: verification PASSED (attempt %d)", node.node_id, verify_count + 1)
+            is_root = run.root_node_id == node.node_id
+            persistent_root = is_root and run.persistent
+            fsm.finish_verify_pass(persistent_root=persistent_root)
+        else:
+            retries_remaining = self.config.max_verify_retries - (verify_count + 1)
+            log.info(
+                "Node %s: verification FAILED (attempt %d, %d retries left)",
+                node.node_id, verify_count + 1, max(0, retries_remaining),
+            )
+            fsm.finish_verify_fail(retries_remaining=max(0, retries_remaining))
+
+    def _is_verification_retry(self, node) -> bool:
+        """Check if this planning phase was triggered by a verification failure."""
+        store = self._ensure_store()
+        events = store.get_node_events(node.node_id)
+        # Walk backwards: if the most recent state_transition into PLANNING
+        # came from VERIFYING, this is a verification retry.
+        for e in reversed(events):
+            if e.event_type == "state_transition" and e.data.get("to") == "planning":
+                return e.data.get("from") == "verifying" or e.data.get("verification") == "failed"
+        return False
+
+    def _build_verify_retry_prompt(self, node, run) -> str:
+        """Build the prompt for re-planning after verification failure."""
+        store = self._ensure_store()
+        events = store.get_node_events(node.node_id)
+
+        # Find the most recent verification_result event
+        test_output = ""
+        test_command = run.test_command or ""
+        for e in reversed(events):
+            if e.event_type == "verification_result":
+                test_output = e.data.get("output", "")
+                test_command = e.data.get("test_command", test_command)
+                break
+
+        has_children = len(store.get_children(node.node_id)) > 0
+        return verification_retry_prompt(
+            task_spec=node.task_spec,
+            test_command=test_command,
+            test_output=test_output,
+            has_children=has_children,
+        )
+
+    def _should_verify(self, node, run) -> bool:
+        return bool(run and run.test_command and run.root_node_id == node.node_id)
 
     # --- Cleanup ---
 
@@ -922,6 +1043,32 @@ def _cost_to_dict(cost) -> dict[str, Any]:
         "output_tokens": cost.output_tokens,
         "total_usd": cost.total_usd,
     }
+
+
+def _run_test_in_worktree(
+    test_command: str, worktree: Path, timeout: int = 1800,
+) -> subprocess.CompletedProcess[str]:
+    """Run a test command in a worktree directory."""
+    return run_test_command(
+        test_command,
+        worktree,
+        timeout_seconds=timeout,
+    )
+
+
+def _truncate_test_output(stdout: str, stderr: str, max_chars: int = 4000) -> str:
+    """Combine and truncate test output for the retry prompt."""
+    combined = ""
+    if stderr.strip():
+        combined += stderr.strip()
+    if stdout.strip():
+        if combined:
+            combined += "\n\n"
+        combined += stdout.strip()
+    if len(combined) > max_chars:
+        # Keep the tail (most useful part — test summary and failures)
+        combined = "... (truncated)\n" + combined[-max_chars:]
+    return combined
 
 
 def get_node_tree(store: StateStore, run_id: str) -> list[dict[str, Any]]:

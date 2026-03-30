@@ -1,5 +1,6 @@
 """Tests for multi-pass persistent runs, domain registry, and routing."""
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -38,7 +39,7 @@ class ScriptedAdapter(AgentAdapter):
 
         raw = {k: v for k, v in resp.items() if not k.startswith("_")}
         return NodeResult(
-            session_id=f"session-{len(self._call_log)}",
+            session_id=resp.get("_session_id", f"session-{len(self._call_log)}"),
             raw=raw, result_text="", cost=CostRecord(total_usd=0.01),
             stop_reason="end_turn",
         )
@@ -184,6 +185,53 @@ class TestPersistentRun:
         assert (root_wt / "auth.py").exists()
         assert (root_wt / "hashing.py").exists()
         store.close()
+
+    @pytest.mark.asyncio
+    async def test_continue_reuses_existing_planning_session(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "auth", "objective": "build auth",
+                  "success_criteria": ["works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "module_scope": "Auth module"},
+             ],
+             "_session_id": "root-plan"},
+            {"action": "solve_directly", "rationale": "ok", "_session_id": "child-plan"},
+            {"status": "implemented", "summary": "built auth",
+             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+            {"verdict": "accept", "reason": "ok", "_session_id": "root-review"},
+            {"action": "route_to_children", "rationale": "auth domain",
+             "routes": [{"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                         "task_spec": "add password hashing"}],
+             "_session_id": "root-review"},
+            {"status": "implemented", "summary": "added hashing",
+             "_commit": True, "_commit_file": "hashing.py", "_commit_msg": "add hashing"},
+            {"verdict": "accept", "reason": "ok"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build an app", persistent=True)
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        child_id = store.get_children(root.node_id)[0].node_id
+        adapter._responses[0]["routes"][0]["child_node_id"] = child_id
+        store.close()
+
+        await orch.continue_run(run_id, "add password hashing to the auth module")
+
+        conn = sqlite3.connect(config.db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                ("root-review",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1
 
     @pytest.mark.asyncio
     async def test_continue_spawns_new_child(self, config):

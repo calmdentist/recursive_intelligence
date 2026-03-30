@@ -27,6 +27,7 @@ from recursive_intelligence.benchmarks.models import (
 from recursive_intelligence.benchmarks.reporting import build_suite_report, export_report
 from recursive_intelligence.benchmarks.runner import BenchmarkRunner, compare_modes
 from recursive_intelligence.config import RuntimeConfig
+from recursive_intelligence.runtime.orchestrator import _run_test_in_worktree
 
 
 def _commit_fix(worktree: Path) -> None:
@@ -214,6 +215,28 @@ def test_run_test_command_uses_python3_for_env_python_scripts(tmp_path: Path):
     script.chmod(0o755)
 
     completed = _run_test_command("BENCH_FLAG=ok bin/test", repo, timeout_seconds=10)
+
+    assert completed.returncode == 0
+    lines = completed.stdout.strip().splitlines()
+    assert Path(lines[0]).name.startswith("python3")
+    assert lines[1] == "ok"
+
+
+def test_recursive_verification_uses_python3_for_env_python_scripts(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bin_dir = repo / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "test"
+    script.write_text(
+        "#!/usr/bin/env python\n"
+        "import os, sys\n"
+        "print(sys.executable)\n"
+        "print(os.environ['BENCH_FLAG'])\n"
+    )
+    script.chmod(0o755)
+
+    completed = _run_test_in_worktree("BENCH_FLAG=ok bin/test", repo, timeout=10)
 
     assert completed.returncode == 0
     lines = completed.stdout.strip().splitlines()

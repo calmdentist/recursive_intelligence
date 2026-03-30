@@ -51,6 +51,15 @@ class ScriptedAdapter(AgentAdapter):
         )
 
 
+class NoopAdapter(AgentAdapter):
+    @property
+    def name(self) -> str:
+        return "noop"
+
+    async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+        raise RuntimeError(f"Unexpected adapter call in mode={mode}")
+
+
 def _make_commit(worktree: Path, filename: str, message: str) -> None:
     (worktree / filename).write_text(f"content of {filename}\n")
     subprocess.run(["git", "add", "."], cwd=str(worktree), capture_output=True)
@@ -104,6 +113,40 @@ class TestSolveDirectly:
         assert len(adapter.calls) == 2
         assert adapter.calls[0]["mode"] == "plan"
         assert adapter.calls[1]["mode"] == "execute"
+
+    @pytest.mark.asyncio
+    async def test_resume_run_from_verifying_completes(self, config):
+        (config.repo_root / "ok.txt").write_text("ok")
+        config.ensure_dirs()
+        store = StateStore(config.db_path)
+        run = store.create_run(str(config.repo_root), "verify task", test_command="sh -c 'test -f ok.txt'")
+        node = store.create_node(
+            run.run_id,
+            "verify task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/verify",
+        )
+        store.set_root_node(run.run_id, node.node_id)
+        store.transition_node(node.node_id, NodeState.PLANNING)
+        store.transition_node(node.node_id, NodeState.EXECUTING)
+        store.transition_node(node.node_id, NodeState.VERIFYING)
+        store.close()
+
+        orch = Orchestrator(config, NoopAdapter())
+        await orch.resume_run(run.run_id)
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run.run_id)
+        root = store.get_node(node.node_id)
+        verify_events = [
+            e for e in store.get_node_events(node.node_id)
+            if e.event_type == "verification_result"
+        ]
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(verify_events) == 1
+        assert verify_events[0].data["passed"] is True
+        store.close()
 
 
 class TestRecursiveFlow:
@@ -166,6 +209,56 @@ class TestRecursiveFlow:
         # Verify call sequence
         modes = [c["mode"] for c in adapter.calls]
         assert modes == ["plan", "plan", "execute", "plan", "execute", "review", "review"]
+
+    @pytest.mark.asyncio
+    async def test_verification_runs_once_after_root_merge(self, git_repo):
+        config = RuntimeConfig(repo_root=git_repo, max_parallel_children=1)
+        adapter = ScriptedAdapter([
+            {
+                "action": "spawn_children",
+                "rationale": "split task",
+                "children": [
+                    {"idempotency_key": "child-a", "objective": "implement A", "success_criteria": ["A works"]},
+                    {"idempotency_key": "child-b", "objective": "implement B", "success_criteria": ["B works"]},
+                ],
+            },
+            {"action": "solve_directly", "rationale": "simple"},
+            {"status": "implemented", "summary": "added A",
+             "_commit": True, "_commit_file": "a.txt", "_commit_msg": "add A"},
+            {"action": "solve_directly", "rationale": "simple"},
+            {"status": "implemented", "summary": "added B",
+             "_commit": True, "_commit_file": "b.txt", "_commit_msg": "add B"},
+            {"verdict": "accept", "reason": "looks good"},
+            {"verdict": "accept", "reason": "looks good"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run(
+            "build A and B",
+            test_command="sh -c 'test -f a.txt && test -f b.txt'",
+        )
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        children = store.get_children(root.node_id)
+        root_verify = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "verification_result"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(root_verify) == 1
+        assert root_verify[0].data["passed"] is True
+        assert all(child.state == NodeState.COMPLETED for child in children)
+        for child in children:
+            child_verify = [
+                e for e in store.get_node_events(child.node_id)
+                if e.event_type == "verification_result"
+            ]
+            assert child_verify == []
+        store.close()
 
     @pytest.mark.asyncio
     async def test_tree_output(self, config):
@@ -459,6 +552,42 @@ class TestChildFailure:
         child_nodes = [n for n in nodes if n.parent_id is not None]
         assert len(child_nodes) == 1
         assert child_nodes[0].state == NodeState.FAILED
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_review_failure_fails_run(self, config):
+        class ReviewFailureAdapter(ScriptedAdapter):
+            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+                if mode == "review":
+                    raise RuntimeError("review backend unavailable")
+                return await super().run(
+                    prompt,
+                    worktree,
+                    mode,
+                    system_prompt=system_prompt,
+                    resume_session_id=resume_session_id,
+                    on_message=on_message,
+                    is_root=is_root,
+                )
+
+        adapter = ReviewFailureAdapter([
+            {"action": "spawn_children", "rationale": "delegate",
+             "children": [
+                 {"idempotency_key": "c1", "objective": "do thing", "success_criteria": ["works"]},
+             ]},
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "done",
+             "_commit": True, "_commit_file": "out.txt", "_commit_msg": "work"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("task needing review")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        assert run.status == "failed"
+        assert root.state == NodeState.FAILED
         store.close()
 
 
