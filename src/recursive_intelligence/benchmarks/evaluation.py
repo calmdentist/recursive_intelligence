@@ -404,10 +404,7 @@ class SWEBenchProEvaluator:
         if shutil.which("docker") is None:
             raise RuntimeError("Docker is required for SWE-Bench Pro evaluation but was not found on PATH.")
         if not self.repo_path.exists():
-            raise RuntimeError(
-                "SWE-Bench Pro evaluator repo not found. "
-                "Set RARI_SWEBENCH_PRO_REPO to a checkout of scaleapi/SWE-bench_Pro-os."
-            )
+            self._clone_evaluator_repo()
         if not (self.repo_path / "swe_bench_pro_eval.py").exists():
             raise RuntimeError(
                 f"SWE-Bench Pro evaluator script not found at {(self.repo_path / 'swe_bench_pro_eval.py')}."
@@ -416,6 +413,20 @@ class SWEBenchProEvaluator:
             raise RuntimeError(
                 f"SWE-Bench Pro run_scripts directory not found at {(self.repo_path / 'run_scripts')}."
             )
+
+    def _clone_evaluator_repo(self) -> None:
+        """Auto-clone the SWE-Bench Pro evaluator repo."""
+        self.repo_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "git", "clone", "--quiet", "--depth", "1",
+                "https://github.com/scaleapi/SWE-bench_Pro-os.git",
+                str(self.repo_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 class FeatureBenchEvaluator:
@@ -583,7 +594,7 @@ def _detect_swebench_pro_patch_applied(stdout_log_path: Path, stderr_log_path: P
         content = path.read_text(errors="ignore").lower()
         if any(marker in content for marker in failure_markers):
             return False
-    return False
+    return True
 
 
 def _clone_repo(repo: str, base_commit: str, destination: Path) -> None:
