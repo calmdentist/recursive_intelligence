@@ -212,6 +212,18 @@ class BenchmarkRunner:
         patch_path = task_dir / f"{mode}.patch"
         ri_artifacts_dir = task_dir / f"{mode}-ri"
 
+        # Accumulate run data so post-run failures don't discard it.
+        run_id: str | None = None
+        runtime_status = "failed"
+        changed_files: list[str] = []
+        cost = CostRecord()
+        duration_ms = 0
+        session_ids: list[str] = []
+        node_count = 0
+        tree_depth = 0
+        tree_breadth = 0
+        patch_text = ""
+
         try:
             await asyncio.to_thread(_clone_repo, task.repo, task.base_commit, repo_dir)
             runtime_config = RuntimeConfig(repo_root=repo_dir)
@@ -222,6 +234,13 @@ class BenchmarkRunner:
                 runner = BaselineRunner(runtime_config, adapter)
                 report = await runner.run(task.build_prompt())
                 duration_ms = int((time.perf_counter() - start) * 1000)
+                run_id = report.run_id
+                runtime_status = report.status
+                changed_files = report.changed_files
+                cost = report.cost
+                session_ids = [report.session_id]
+                node_count = 1
+
                 baseline_worktree = runtime_config.worktrees_dir / f"{report.run_id}-baseline"
                 patch_text = await asyncio.to_thread(
                     _git_diff,
@@ -230,53 +249,52 @@ class BenchmarkRunner:
                     str(baseline_worktree),
                 )
                 patch_path.write_text(patch_text)
+            else:
+                orchestrator = Orchestrator(runtime_config, adapter)
+                run_id = await orchestrator.start_run(task.build_prompt())
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                summary = _summarize_recursive_run(runtime_config, run_id, task.base_commit)
+                runtime_status = summary["status"]
+                changed_files = summary["changed_files"]
+                cost = summary["cost"]
+                session_ids = summary["session_ids"]
+                node_count = summary["node_count"]
+                tree_depth = summary["tree_depth"]
+                tree_breadth = summary["tree_breadth"]
+
+                patch_text = await asyncio.to_thread(
+                    _git_diff,
+                    repo_dir,
+                    task.base_commit,
+                    summary["root_worktree"],
+                )
+                patch_path.write_text(patch_text)
+
+            # Artifact copy and scoring are best-effort — failures here
+            # should not discard the run data collected above.
+            try:
                 await asyncio.to_thread(_copy_ri_artifacts, repo_dir, ri_artifacts_dir)
-                score = await asyncio.to_thread(self._score_patch, task, patch_text, task_dir, mode, evaluator)
-                return BenchmarkModeResult(
-                    mode=mode,
-                    run_id=report.run_id,
-                    runtime_status=report.status,
-                    solved=score.tests_passed,
-                    changed_files=report.changed_files,
-                    cost=report.cost,
-                    duration_ms=duration_ms,
-                    session_ids=[report.session_id],
-                    session_count=1,
-                    node_count=1,
-                    tree_depth=0,
-                    tree_breadth=0,
-                    patch_path=str(patch_path),
-                    patch_bytes=len(patch_text.encode("utf-8")),
-                    ri_artifacts_path=str(ri_artifacts_dir) if ri_artifacts_dir.exists() else None,
-                    score=score,
+            except Exception as copy_exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to copy .ri artifacts for %s/%s: %s", task.instance_id, mode, copy_exc,
                 )
 
-            orchestrator = Orchestrator(runtime_config, adapter)
-            run_id = await orchestrator.start_run(task.build_prompt())
-            duration_ms = int((time.perf_counter() - start) * 1000)
-            summary = _summarize_recursive_run(runtime_config, run_id, task.base_commit)
-            patch_text = await asyncio.to_thread(
-                _git_diff,
-                repo_dir,
-                task.base_commit,
-                summary["root_worktree"],
-            )
-            patch_path.write_text(patch_text)
-            await asyncio.to_thread(_copy_ri_artifacts, repo_dir, ri_artifacts_dir)
             score = await asyncio.to_thread(self._score_patch, task, patch_text, task_dir, mode, evaluator)
+
             return BenchmarkModeResult(
                 mode=mode,
                 run_id=run_id,
-                runtime_status=summary["status"],
+                runtime_status=runtime_status,
                 solved=score.tests_passed,
-                changed_files=summary["changed_files"],
-                cost=summary["cost"],
+                changed_files=changed_files,
+                cost=cost,
                 duration_ms=duration_ms,
-                session_ids=summary["session_ids"],
-                session_count=len(summary["session_ids"]),
-                node_count=summary["node_count"],
-                tree_depth=summary["tree_depth"],
-                tree_breadth=summary["tree_breadth"],
+                session_ids=session_ids,
+                session_count=len(session_ids),
+                node_count=node_count,
+                tree_depth=tree_depth,
+                tree_breadth=tree_breadth,
                 patch_path=str(patch_path),
                 patch_bytes=len(patch_text.encode("utf-8")),
                 ri_artifacts_path=str(ri_artifacts_dir) if ri_artifacts_dir.exists() else None,
@@ -293,19 +311,19 @@ class BenchmarkRunner:
             )
             return BenchmarkModeResult(
                 mode=mode,
-                run_id=None,
-                runtime_status="failed",
+                run_id=run_id,
+                runtime_status=runtime_status,
                 solved=False,
-                changed_files=[],
-                cost=CostRecord(),
-                duration_ms=0,
-                session_ids=[],
-                session_count=0,
-                node_count=0,
-                tree_depth=0,
-                tree_breadth=0,
+                changed_files=changed_files,
+                cost=cost,
+                duration_ms=duration_ms,
+                session_ids=session_ids,
+                session_count=len(session_ids),
+                node_count=node_count,
+                tree_depth=tree_depth,
+                tree_breadth=tree_breadth,
                 patch_path=str(patch_path) if patch_path.exists() else None,
-                patch_bytes=0,
+                patch_bytes=len(patch_text.encode("utf-8")) if patch_text else 0,
                 ri_artifacts_path=str(ri_artifacts_dir) if ri_artifacts_dir.exists() else None,
                 score=empty_score,
                 error=str(exc),
@@ -450,9 +468,30 @@ def _clone_repo(repo: str, base_commit: str, destination: Path) -> None:
 
 
 def _copy_ri_artifacts(repo_dir: Path, destination: Path) -> None:
+    """Copy .ri artifacts, skipping bulky runtime directories and broken symlinks."""
     source = repo_dir / ".ri"
-    if source.exists():
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+    if not source.exists():
+        return
+
+    skip_dirs = {"worktrees", "tools", "datasets"}
+
+    def _ignore(directory: str, contents: list[str]) -> set[str]:
+        if Path(directory) == source:
+            return skip_dirs & set(contents)
+        ignored: set[str] = set()
+        for name in contents:
+            full_path = Path(directory) / name
+            if full_path.is_symlink() and not full_path.exists():
+                ignored.add(name)
+        return ignored
+
+    def _copy_robust(src: str, dst: str) -> None:
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            pass  # skip files that vanish or can't be read
+
+    shutil.copytree(source, destination, dirs_exist_ok=True, ignore=_ignore, copy_function=_copy_robust)
 
 
 def _git_diff(repo_dir: Path, base_commit: str, worktree: str | None = None) -> str:

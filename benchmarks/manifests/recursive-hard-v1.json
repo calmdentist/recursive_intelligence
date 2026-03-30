@@ -1,0 +1,499 @@
+{
+  "manifest_id": "recursive-hard-v1",
+  "title": "Recursive Hard v1",
+  "description": "Proxy-scored hard long-context suite spanning SWE-Bench Pro and FeatureBench. This first-pass manifest is deterministic and versioned so flat-vs-recursive comparisons can be repeated exactly.",
+  "rubric_version": "recursive-hard-proxy-v1",
+  "metadata": {
+    "source_counts": {
+      "swebench_pro": 20,
+      "featurebench": 10
+    },
+    "repo_cap": 2,
+    "sources": [
+      "swebench_pro:ScaleAI/SWE-bench_Pro:test",
+      "featurebench:LiberCoders/FeatureBench:full"
+    ]
+  },
+  "tasks": [
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_element-hq__element-web-4fec436883b601a3cac2d4a58067e597f737b817-vnan",
+      "repo": "element-hq/element-web",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 46
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_ansible__ansible-6cc97447aac5816745278f3735af128afb255c81-v0f01c69f1e2528b935359cfe578530722bca2c59",
+      "repo": "ansible/ansible",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 46
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_internetarchive__openlibrary-11838fad1028672eb975c79d8984f03348500173-v0f5aece3601a5b4419f7ccec1dbda2071be28ee4",
+      "repo": "internetarchive/openlibrary",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 46
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_protonmail__webclients-caf10ba9ab2677761c88522d1ba8ad025779c492",
+      "repo": "protonmail/webclients",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 44
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_ansible__ansible-e40889e7112ae00a21a2c74312b330e67a766cc0-v1055803c3a812189a1133297f7f5468579283f86",
+      "repo": "ansible/ansible",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 44
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_flipt-io__flipt-05d7234fa582df632f70a7cd10194d61bd7043b9",
+      "repo": "flipt-io/flipt",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 3,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 44
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_internetarchive__openlibrary-b67138b316b1e9c11df8a4a8391fe5cc8e75ff9f-ve8c8d62a2b60610a3c4631f5f23ed866bada9818",
+      "repo": "internetarchive/openlibrary",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 44
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_protonmail__webclients-369fd37de29c14c690cb3b1c09a949189734026f",
+      "repo": "protonmail/webclients",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 3,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_flipt-io__flipt-e50808c03e4b9d25a6a78af9c61a3b1616ea356b",
+      "repo": "flipt-io/flipt",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 3,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_element-hq__element-web-cf3c899dd1f221aa1a1f4c5a80dffc05b9c21c85-vnan",
+      "repo": "element-hq/element-web",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_navidrome__navidrome-3982ba725883e71d4e3e618c61d5140eeb8d850a",
+      "repo": "navidrome/navidrome",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_qutebrowser__qutebrowser-3fd8e12949b8feda401930574facf09dd4180bba",
+      "repo": "qutebrowser/qutebrowser",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 4,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_navidrome__navidrome-89b12b34bea5687c70e4de2109fd1e7330bb2ba2",
+      "repo": "navidrome/navidrome",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 3,
+        "runtime_dependence": 4,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 42
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_NodeBB__NodeBB-b398321a5eb913666f903a794219833926881a8f-vd59a5728dfc977f44533186ace531248c2917516",
+      "repo": "NodeBB/NodeBB",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_future-architect__vuls-1832b4ee3a20177ad313d806983127cb6e53f5cf",
+      "repo": "future-architect/vuls",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 3,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_gravitational__teleport-c1b1c6a1541c478d7777a48fca993cc8206c73b9",
+      "repo": "gravitational/teleport",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_future-architect__vuls-6eff6a9329a65cc412e79b8f82444dfa3d0f0b5a",
+      "repo": "future-architect/vuls",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_NodeBB__NodeBB-9c576a0758690f45a6ca03b5884c601e473bf2c1-vd59a5728dfc977f44533186ace531248c2917516",
+      "repo": "NodeBB/NodeBB",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 2,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_tutao__tutanota-f373ac3808deefce8183dad8d16729839cc330c1-v2939aa9f4356f0dc9f523ee5ce19d09e08ab979b",
+      "repo": "tutao/tutanota",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "swebench_pro",
+      "dataset_name": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "instance_id": "instance_tutao__tutanota-fbdb72a2bd39b05131ff905780d9d4a2a074de26-vbc0d9ba8f0071fbe982809910959a6ff8884dbbf",
+      "repo": "tutao/tutanota",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 2,
+        "underspecification": 1,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "mlflow__mlflow.93dab383.test_assessment.df512d1b.lv1",
+      "repo": "mlflow/mlflow",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 1,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "mlflow__mlflow.93dab383.test_unity_catalog_rest_store.f47a7d9f.lv1",
+      "repo": "mlflow/mlflow",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 1,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "scikit-learn__scikit-learn.5741bac9.test_public_functions.28421aef.lv1",
+      "repo": "scikit-learn/scikit-learn",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 1,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 40
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "pandas-dev__pandas.82fa2715.test_info.d8a64ebf.lv1",
+      "repo": "pandas-dev/pandas",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "Lightning-AI__pytorch-lightning.126fa6f1.test_hooks.34620588.lv1",
+      "repo": "Lightning-AI/pytorch-lightning",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "sphinx-doc__sphinx.e347e59c.test_build_html.d253ea54.lv1",
+      "repo": "sphinx-doc/sphinx",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "huggingface__transformers.e2e8dbed.test_modeling_colpali.370cfbdd.lv1",
+      "repo": "huggingface/transformers",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "huggingface__transformers.e2e8dbed.test_modeling_mimi.3118abde.lv1",
+      "repo": "huggingface/transformers",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "linkedin__Liger-Kernel.c856fbab.test_mini_models.96209d55.lv1",
+      "repo": "linkedin/Liger-Kernel",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    },
+    {
+      "benchmark": "featurebench",
+      "dataset_name": "LiberCoders/FeatureBench",
+      "split": "full",
+      "instance_id": "pypa__setuptools.d198e86f.test_bdist_wheel.51482fc6.lv1",
+      "repo": "pypa/setuptools",
+      "selection_scores": {
+        "context_spread": 4,
+        "integration_pressure": 4,
+        "runtime_dependence": 0,
+        "underspecification": 3,
+        "decomposability": 4,
+        "total": 38
+      },
+      "notes": null
+    }
+  ]
+}
