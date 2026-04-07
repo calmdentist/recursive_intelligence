@@ -17,10 +17,11 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from recursive_intelligence.adapters.base import AgentAdapter, StreamCallback
 from recursive_intelligence.config import RuntimeConfig
-from recursive_intelligence.git.diffing import ArtifactBundle, build_artifact_bundle
+from recursive_intelligence.git.diffing import ArtifactBundle, build_artifact_bundle, find_scope_violations
 from recursive_intelligence.git.merge import (
     cherry_pick_child,
     abort_cherry_pick,
@@ -35,6 +36,7 @@ from recursive_intelligence.git.worktrees import (
     remove_worktree,
 )
 from recursive_intelligence.adapters.claude.prompts import (
+    downstream_response_prompt,
     planning_prompt,
     execution_prompt,
     review_prompt as build_review_prompt_template,
@@ -45,12 +47,18 @@ from recursive_intelligence.adapters.claude.prompts import (
     verification_retry_prompt,
 )
 from recursive_intelligence.runtime.node_fsm import (
+    blocker_to_dict,
+    blocker_to_request_dict,
+    BlockerInfo,
     ChildSpec,
+    EscalationInfo,
     ExecutionResult,
     NodeFSM,
     PlanDecision,
     ReviewVerdict,
     RouteSpec,
+    UpstreamRequest,
+    request_to_dict,
 )
 from recursive_intelligence.runtime.state_store import NodeState, StateStore
 from recursive_intelligence.test_commands import run_test_command
@@ -88,6 +96,114 @@ class Orchestrator:
         if node_id == self._root_node_id and self._on_message:
             return self._on_message
         return None
+
+    def _new_request_id(self) -> str:
+        return f"req-{uuid4().hex[:12]}"
+
+    def _normalize_request_response(self, resolution: str, response_text: str) -> str:
+        text = response_text.strip()
+        if text:
+            return text
+        if resolution == "approve":
+            return "Approved."
+        if resolution == "decline":
+            return "Declined."
+        raise ValueError("A response is required to answer this request")
+
+    def _latest_root_inbox_request(self, run_id: str) -> dict[str, Any] | None:
+        store = self._ensure_store()
+        inbox = store.get_run_inbox(run_id)
+        if not inbox:
+            return None
+        return inbox[0]
+
+    def _resolve_request_chain(
+        self,
+        run,
+        root,
+        request_item: dict[str, Any],
+        response_text: str,
+        resolution: str = "answer",
+    ) -> bool:
+        """Route a resolved root-facing request back to the paused node."""
+        store = self._ensure_store()
+        request_payload = request_item.get("request", {})
+        source_child_id = request_item.get("source_child_id")
+        request_id = request_payload.get("request_id", "")
+        request_summary = request_payload.get("summary", "")
+        response_text = self._normalize_request_response(resolution, response_text)
+        store.append_event(run.run_id, root.node_id, "user_input", {
+            "input": response_text,
+            "request_summary": request_summary,
+            "request_id": request_id,
+            "resolution": resolution,
+        })
+
+        if source_child_id:
+            child = store.get_node(source_child_id)
+            if child is None:
+                return False
+            store.append_event(run.run_id, root.node_id, "request_resolved", {
+                "request_id": request_id,
+                "resolved_by": "user_input",
+                "response_text": response_text,
+                "source_child_id": source_child_id,
+                "resolution": resolution,
+            })
+            store.append_event(child.run_id, child.node_id, "response_downstream", {
+                "response_text": response_text,
+                "request": request_payload,
+                "source_node_id": root.node_id,
+                "request_id": request_id,
+                "resolution": resolution,
+            })
+            store.append_event(child.run_id, child.node_id, "request_resolved", {
+                "request_id": request_id,
+                "resolved_by": "root_response",
+                "response_text": response_text,
+                "source_node_id": root.node_id,
+                "resolution": resolution,
+            })
+            if child.state == NodeState.PAUSED:
+                store.transition_node(child.node_id, NodeState.EXECUTING, {
+                    "reason": "response_downstream",
+                    "source_node_id": root.node_id,
+                    "request_id": request_id,
+                })
+            store.transition_node(root.node_id, NodeState.WAITING_ON_CHILDREN, {
+                "reason": "request_resolved",
+                "source_child_id": source_child_id,
+                "request_id": request_id,
+            })
+            store.increment_run_telemetry(run.run_id, resolved_requests_count=1)
+            return True
+
+        store.append_event(run.run_id, root.node_id, "request_resolved", {
+            "request_id": request_id,
+            "resolved_by": "user_input",
+            "response_text": response_text,
+            "resolution": resolution,
+        })
+        store.append_event(run.run_id, root.node_id, "response_downstream", {
+            "response_text": response_text,
+            "request": request_payload,
+            "source_node_id": root.node_id,
+            "request_id": request_id,
+            "resolution": resolution,
+        })
+        store.transition_node(root.node_id, NodeState.EXECUTING, {
+            "reason": "response_downstream",
+            "request_id": request_id,
+        })
+        store.increment_run_telemetry(run.run_id, resolved_requests_count=1)
+        return True
+
+    def _resume_paused_request_chain(self, run, root, user_input: str) -> bool:
+        """If the root is paused on an upstream request, route the response directly."""
+        request_item = self._latest_root_inbox_request(run.run_id)
+        if request_item is None:
+            return False
+        return self._resolve_request_chain(run, root, request_item, user_input, resolution="answer")
 
     # --- Run lifecycle ---
 
@@ -136,15 +252,48 @@ class Orchestrator:
         if run.status != "paused":
             raise ValueError(f"Run {run_id} is {run.status}, not paused")
 
-        store.resume_paused_run(run_id)
-
         root = store.get_node(run.root_node_id)
         if root is None or root.state != NodeState.PAUSED:
             raise ValueError(f"Root node is not paused (state={root.state.value if root else 'missing'})")
 
         self._root_node_id = root.node_id
-        fsm = NodeFSM(store, root.node_id)
-        fsm.resume_from_pause(user_input)
+        store.resume_paused_run(run_id)
+        store.increment_run_telemetry(run_id, human_inputs_count=1)
+        if not self._resume_paused_request_chain(run, root, user_input):
+            fsm = NodeFSM(store, root.node_id)
+            fsm.resume_from_pause(user_input)
+
+        await self._drive_root(run_id, root.node_id, persistent=True)
+        return run_id
+
+    async def resolve_request(
+        self,
+        run_id: str,
+        request_id: str,
+        response_text: str,
+        resolution: str = "answer",
+    ) -> str:
+        """Resolve a specific root-inbox request and continue the run."""
+        store = self._ensure_store()
+        run = store.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run {run_id} not found")
+        if run.status != "paused":
+            raise ValueError(f"Run {run_id} is {run.status}, not paused")
+
+        root = store.get_node(run.root_node_id)
+        if root is None or root.state != NodeState.PAUSED:
+            raise ValueError(f"Root node is not paused (state={root.state.value if root else 'missing'})")
+
+        request_item = store.get_inbox_request(run_id, request_id)
+        if request_item is None:
+            raise ValueError(f"Request {request_id} not found in the root inbox for run {run_id}")
+
+        self._root_node_id = root.node_id
+        store.resume_paused_run(run_id)
+        store.increment_run_telemetry(run_id, human_inputs_count=1)
+        if not self._resolve_request_chain(run, root, request_item, response_text, resolution=resolution):
+            raise ValueError(f"Could not resolve request {request_id}")
 
         await self._drive_root(run_id, root.node_id, persistent=True)
         return run_id
@@ -333,8 +482,14 @@ class Orchestrator:
 
         return routing_prompt(user_input, domain_dicts, run.pass_count)
 
+    def _append_downstream_task(self, run_id: str, node_id: str, kind: str, **data: Any) -> dict[str, Any]:
+        store = self._ensure_store()
+        payload = {"kind": kind, **data}
+        store.append_event(run_id, node_id, "downstream_task", payload)
+        return payload
+
     def _prepare_child_reactivation(self, parent_node, route: RouteSpec) -> None:
-        """Prepare a child for reactivation with a new task."""
+        """Prepare a child for downstream follow-up work."""
         store = self._ensure_store()
         child = store.get_node(route.child_node_id)
         if child is None:
@@ -349,12 +504,48 @@ class Orchestrator:
                 prev_summary = evt.data.get("raw", {}).get("summary", "")
                 break
 
-        # Store the reactivation event (will be picked up by _run_execution)
-        store.append_event(child.run_id, child.node_id, "reactivation_requested", {
-            "new_task": route.task_spec,
-            "previous_summary": prev_summary,
-            "original_task": child.task_spec,
-        })
+        self._append_downstream_task(
+            child.run_id,
+            child.node_id,
+            "reactivation",
+            summary="Follow-up work routed from parent",
+            task_spec=route.task_spec,
+            previous_summary=prev_summary,
+            original_task=child.task_spec,
+            requested_by=parent_node.node_id,
+            domain_name=route.domain_name,
+        )
+
+    def _latest_pending_work_event(self, events: list[Any]) -> Any | None:
+        pending_event = None
+        for event in events:
+            if event.event_type in ("downstream_task", "reactivation_requested", "revision_requested", "response_downstream"):
+                pending_event = event
+            elif event.event_type in ("execution_result", "downstream_task_result"):
+                pending_event = None
+        return pending_event
+
+    def _build_downstream_task_prompt(self, node, task_data: dict[str, Any]) -> str:
+        task_kind = task_data.get("kind", "")
+        if task_kind == "reactivation":
+            return reactivation_prompt(
+                original_task=task_data.get("original_task", node.task_spec),
+                previous_summary=task_data.get("previous_summary", ""),
+                new_task=task_data.get("task_spec", ""),
+                is_root=self._is_root(node.node_id),
+            )
+        if task_kind == "revision":
+            return revision_prompt(
+                task_data.get("task_spec", ""),
+                is_root=self._is_root(node.node_id),
+            )
+        if task_kind == "merge_conflict":
+            return conflict_resolution_prompt(
+                task_data.get("child_id", ""),
+                task_data.get("conflict_files", []),
+                task_data.get("conflict_diff", ""),
+            )
+        return execution_prompt(node.task_spec, is_root=self._is_root(node.node_id))
 
     # --- Execution ---
 
@@ -364,31 +555,37 @@ class Orchestrator:
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
 
         events = store.get_node_events(node.node_id)
+        pending_event = self._latest_pending_work_event(events)
 
-        # Find the most recent pending work event AFTER the last execution_result.
-        # This ensures revisions override stale reactivation events and vice versa.
-        last_exec_idx = -1
-        for i, e in enumerate(events):
-            if e.event_type == "execution_result":
-                last_exec_idx = i
-
-        pending_event = None
-        for e in events[last_exec_idx + 1:]:
-            if e.event_type in ("reactivation_requested", "revision_requested"):
-                pending_event = e  # last one wins
-
-        if pending_event and pending_event.event_type == "reactivation_requested":
+        if pending_event and pending_event.event_type == "downstream_task":
+            prompt = self._build_downstream_task_prompt(node, pending_event.data)
+            resume_id = node.session_id
+        elif pending_event and pending_event.event_type == "reactivation_requested":
             prompt = reactivation_prompt(
                 original_task=pending_event.data.get("original_task", node.task_spec),
                 previous_summary=pending_event.data.get("previous_summary", ""),
                 new_task=pending_event.data.get("new_task", ""),
+                is_root=self._is_root(node.node_id),
             )
             resume_id = node.session_id
         elif pending_event and pending_event.event_type == "revision_requested":
-            prompt = revision_prompt(pending_event.data.get("follow_up", ""))
+            prompt = revision_prompt(
+                pending_event.data.get("follow_up", ""),
+                is_root=self._is_root(node.node_id),
+            )
+            resume_id = node.session_id
+        elif pending_event and pending_event.event_type == "response_downstream":
+            request = pending_event.data.get("request", {})
+            prompt = downstream_response_prompt(
+                request_summary=request.get("summary", ""),
+                response_text=pending_event.data.get("response_text", ""),
+                original_details=request.get("details", ""),
+                resolution=pending_event.data.get("resolution", "answer"),
+                is_root=self._is_root(node.node_id),
+            )
             resume_id = node.session_id
         else:
-            prompt = execution_prompt(node.task_spec)
+            prompt = execution_prompt(node.task_spec, is_root=self._is_root(node.node_id))
             resume_id = None
 
         try:
@@ -412,6 +609,32 @@ class Orchestrator:
 
         # Auto-update domain registry with actual changed files
         execution = self._parse_execution_result(result.raw)
+        if execution.request:
+            request = execution.request
+            if not request.request_id:
+                request.request_id = self._new_request_id()
+            request_dict = request_to_dict(request)
+            store.append_event(node.run_id, node.node_id, "request_upstream", {
+                "request": request_dict,
+                "resume_state": "executing",
+            })
+            if self._is_root(node.node_id):
+                self._record_root_request(node.run_id, node.node_id, request)
+        elif execution.status == "blocked" and execution.blocker and execution.blocker.needs_user_input:
+            request_payload = blocker_to_request_dict(execution.blocker)
+            if not request_payload.get("request_id"):
+                request_payload["request_id"] = self._new_request_id()
+            store.append_event(node.run_id, node.node_id, "request_upstream", {
+                "request": request_payload,
+                "resume_state": "executing",
+                "blocker": blocker_to_dict(execution.blocker),
+            })
+            if self._is_root(node.node_id):
+                self._record_root_request(
+                    node.run_id,
+                    node.node_id,
+                    self._request_from_dict(request_payload),
+                )
         if execution.changed_files:
             self._update_domain_from_changed_files(node, execution.changed_files)
 
@@ -421,13 +644,11 @@ class Orchestrator:
         fsm.finish_execution(execution, verify=should_verify)
 
     def _update_domain_from_changed_files(self, node, changed_files: list[str]) -> None:
-        """Auto-update domain file_patterns from actual files touched."""
+        """Backfill empty domain scopes from actual files touched."""
         store = self._ensure_store()
         domain = store.get_domain_by_child(node.node_id)
-        if domain and changed_files:
-            existing = set(domain.file_patterns)
-            existing.update(changed_files)
-            store.update_domain(domain.domain_id, file_patterns=sorted(existing))
+        if domain and changed_files and not domain.file_patterns:
+            store.update_domain(domain.domain_id, file_patterns=sorted(set(changed_files)))
 
     # --- Children ---
 
@@ -507,20 +728,82 @@ class Orchestrator:
                 _drive_child_safe(cid) for cid in children_to_drive
             ])
 
+        requests = self._collect_pending_child_requests(store.get_children(fsm.node_id))
+        if requests:
+            self._pause_for_child_request(fsm, requests)
+            return
+
         fsm.wake_for_review()
 
     def _has_pending_work(self, child) -> bool:
-        """Check if a child has pending revision or reactivation."""
+        """Check if a child has pending downstream work."""
         store = self._ensure_store()
         events = store.get_node_events(child.node_id)
-        last_exec_idx = -1
-        last_work_idx = -1
-        for i, e in enumerate(events):
-            if e.event_type == "execution_result":
-                last_exec_idx = i
-            elif e.event_type in ("revision_requested", "reactivation_requested"):
-                last_work_idx = i
-        return last_work_idx > last_exec_idx
+        return self._latest_pending_work_event(events) is not None
+
+    def _collect_pending_child_requests(self, children: list[Any]) -> list[dict[str, Any]]:
+        requests: list[dict[str, Any]] = []
+        for child in children:
+            request = self._latest_upstream_request(child)
+            if request:
+                requests.append({
+                    "child_id": child.node_id,
+                    "task_spec": child.task_spec,
+                    "request": request,
+                })
+        return requests
+
+    def _latest_upstream_request(self, node) -> dict[str, Any] | None:
+        if node.state != NodeState.PAUSED:
+            return None
+        store = self._ensure_store()
+        latest = store.get_latest_request(node.node_id)
+        return latest["request"] if latest else None
+
+    def _pause_for_child_request(self, fsm: NodeFSM, requests: list[dict[str, Any]]) -> None:
+        store = self._ensure_store()
+        node = fsm.node
+        primary = requests[0]
+        request = primary["request"]
+        if self._is_root(node.node_id):
+            self._record_root_request(
+                node.run_id,
+                node.node_id,
+                self._request_from_dict(request),
+                source_child_id=primary["child_id"],
+            )
+        else:
+            store.append_event(node.run_id, node.node_id, "request_forwarded_upstream", {
+                "source_child_id": primary["child_id"],
+                "source_task_spec": primary["task_spec"],
+                "request": request,
+                "request_count": len(requests),
+            })
+        store.transition_node(node.node_id, NodeState.PAUSED, {
+            "reason": "child_request",
+            "source_child_id": primary["child_id"],
+            "request": request,
+            "request_id": request.get("request_id", ""),
+        })
+
+    def _record_root_request(
+        self,
+        run_id: str,
+        node_id: str,
+        request: UpstreamRequest,
+        source_child_id: str | None = None,
+    ) -> None:
+        store = self._ensure_store()
+        store.append_event(run_id, node_id, "root_request_upstream", {
+            "source_child_id": source_child_id,
+            "request": request_to_dict(request),
+        })
+        store.increment_run_telemetry(
+            run_id,
+            user_interruptions_count=1,
+            root_escalations_count=1,
+            root_requests_count=1,
+        )
 
     # --- Review ---
 
@@ -639,9 +922,16 @@ class Orchestrator:
             log.info("Node %s review of %s: %s", node.node_id, child.node_id, verdict.verdict)
 
             if verdict.verdict == "revise":
-                store.append_event(child.run_id, child.node_id, "revision_requested", {
-                    "follow_up": verdict.follow_up,
-                })
+                self._append_downstream_task(
+                    child.run_id,
+                    child.node_id,
+                    "revision",
+                    summary=verdict.reason or "Review requested changes",
+                    task_spec=verdict.follow_up,
+                    reason=verdict.reason,
+                    requested_by=node.node_id,
+                    source_child_id=child.node_id,
+                )
 
             fsm.apply_review_verdict(verdict)
 
@@ -726,6 +1016,30 @@ class Orchestrator:
                 })
                 continue
 
+            bundle = build_artifact_bundle(
+                node_id=child.node_id,
+                worktree=child_wt,
+                base_ref=base_sha or "HEAD~1",
+                commit_sha=child_sha,
+            )
+            domain = store.get_domain_by_child(child.node_id)
+            scope_violations = find_scope_violations(
+                bundle.changed_files,
+                domain.file_patterns if domain else None,
+            )
+            if scope_violations:
+                store.append_event(node.run_id, node.node_id, "ownership_violation", {
+                    "child_id": child.node_id,
+                    "allowed_patterns": domain.file_patterns if domain else [],
+                    "violations": scope_violations,
+                })
+                store.increment_run_telemetry(node.run_id, ownership_violations_count=1)
+                fsm.fail(
+                    f"Child {child.node_id} modified files outside its declared scope",
+                    failure_type="ownership_violation",
+                )
+                return
+
             result = cherry_pick_child(parent_wt, child_sha, child.node_id, base_sha=base_sha)
 
             store.append_event(node.run_id, node.node_id, "child_integrated", {
@@ -785,9 +1099,26 @@ class Orchestrator:
         conflict_diff = get_conflict_diff(parent_wt)
         if not conflict_diff:
             log.error("No conflict diff available for %s", child_id)
+            store.append_event(node.run_id, node.node_id, "downstream_task_result", {
+                "kind": "merge_conflict",
+                "child_id": child_id,
+                "status": "failed",
+                "reason": "No conflict diff available",
+                "conflict_files": conflict_files,
+            })
             return False
 
-        prompt = conflict_resolution_prompt(child_id, conflict_files, conflict_diff)
+        task_data = self._append_downstream_task(
+            node.run_id,
+            node.node_id,
+            "merge_conflict",
+            summary=f"Resolve merge conflict while integrating {child_id}",
+            child_id=child_id,
+            conflict_files=conflict_files,
+            conflict_diff=conflict_diff,
+            requested_by=node.node_id,
+        )
+        prompt = self._build_downstream_task_prompt(node, task_data)
 
         log.info("Asking parent %s to resolve conflict with %s (%s)",
                  node.node_id, child_id, conflict_files)
@@ -803,9 +1134,20 @@ class Orchestrator:
             )
         except Exception as e:
             log.error("Conflict resolution failed for %s: %s", child_id, e)
+            store.append_event(node.run_id, node.node_id, "downstream_task_result", {
+                "kind": "merge_conflict",
+                "child_id": child_id,
+                "status": "failed",
+                "reason": str(e),
+                "conflict_files": conflict_files,
+            })
             return False
 
+        previous_session_id = node.session_id
         store.update_node(node.node_id, session_id=result.session_id)
+        if result.session_id != previous_session_id or not store.session_exists(result.session_id):
+            store.create_session(result.session_id, node.node_id, self.adapter.name)
+        store.finish_session(result.session_id)
 
         raw = result.raw
         status = raw.get("status", "")
@@ -813,6 +1155,13 @@ class Orchestrator:
         if status == "irreconcilable":
             log.warning("Parent declared conflict irreconcilable: %s",
                         raw.get("reason", ""))
+            store.append_event(node.run_id, node.node_id, "downstream_task_result", {
+                "kind": "merge_conflict",
+                "child_id": child_id,
+                "status": "irreconcilable",
+                "reason": raw.get("reason", ""),
+                "conflict_files": conflict_files,
+            })
             return False
 
         # Whether the LLM said "resolved" or returned unexpected JSON,
@@ -820,7 +1169,16 @@ class Orchestrator:
         # The LLM may have edited files but not committed, or committed
         # but CHERRY_PICK_HEAD still exists. Use stage_and_continue to
         # guarantee the cherry-pick is complete.
-        return self._finalize_cherry_pick(parent_wt, child_id, raw.get("summary", ""))
+        finalized = self._finalize_cherry_pick(parent_wt, child_id, raw.get("summary", ""))
+        store.append_event(node.run_id, node.node_id, "downstream_task_result", {
+            "kind": "merge_conflict",
+            "child_id": child_id,
+            "status": "completed" if finalized else "failed",
+            "summary": raw.get("summary", ""),
+            "conflict_files": conflict_files,
+            "resolved_sha": get_head_sha(parent_wt) if finalized else "",
+        })
+        return finalized
 
     def _finalize_cherry_pick(self, worktree: Path, child_id: str, summary: str) -> bool:
         """Ensure a cherry-pick is fully completed after LLM conflict resolution.
@@ -1009,11 +1367,54 @@ class Orchestrator:
         )
 
     def _parse_execution_result(self, raw: dict[str, Any]) -> ExecutionResult:
+        request = None
+        if raw.get("status") == "request_upstream":
+            request_raw = raw.get("request", {})
+            request = UpstreamRequest(
+                kind=request_raw.get("kind", "clarification"),
+                summary=request_raw.get("summary", raw.get("summary", raw.get("details", ""))),
+                details=request_raw.get("details", raw.get("details", "")),
+                action_requested=request_raw.get("action_requested", raw.get("action_requested", "")),
+                requires_input=request_raw.get("requires_input", True),
+                urgency=request_raw.get("urgency", "normal"),
+            )
+
+        blocker = None
+        if raw.get("status", "implemented") == "blocked":
+            blocker_raw = raw.get("blocker") or {}
+            legacy_escalation = raw.get("escalation") or blocker_raw.get("escalation")
+            escalation = None
+            if legacy_escalation:
+                escalation = EscalationInfo(
+                    kind=legacy_escalation.get("kind", blocker_raw.get("kind", raw.get("kind", "blocked"))),
+                    summary=legacy_escalation.get("summary", blocker_raw.get("summary", raw.get("details", ""))),
+                    details=legacy_escalation.get("details", blocker_raw.get("details", raw.get("details", ""))),
+                    action_requested=legacy_escalation.get("action_requested", raw.get("action_requested", "")),
+                )
+            elif blocker_raw.get("needs_user_input") or raw.get("needs_user_input"):
+                escalation = EscalationInfo(
+                    kind=blocker_raw.get("kind", raw.get("kind", "blocked")),
+                    summary=blocker_raw.get("summary", raw.get("summary", raw.get("details", ""))),
+                    details=blocker_raw.get("details", raw.get("details", "")),
+                    action_requested=raw.get("action_requested", ""),
+                )
+
+            blocker = BlockerInfo(
+                kind=blocker_raw.get("kind", raw.get("kind", "blocked")),
+                recoverable=blocker_raw.get("recoverable", raw.get("recoverable", True)),
+                details=blocker_raw.get("details", raw.get("details", "")),
+                needs_user_input=blocker_raw.get("needs_user_input", raw.get("needs_user_input", False)),
+                owner=blocker_raw.get("owner", raw.get("owner", "root" if escalation else "node")),
+                urgency=blocker_raw.get("urgency", raw.get("urgency", "normal")),
+                escalation=escalation,
+            )
         return ExecutionResult(
             status=raw.get("status", "implemented"),
             summary=raw.get("summary", ""),
             changed_files=raw.get("changed_files"),
             commit_sha=raw.get("result_commit_sha") or raw.get("commit_sha"),
+            request=request,
+            blocker=blocker,
         )
 
     def _parse_review_verdict(self, raw: dict[str, Any], child_id: str) -> ReviewVerdict:
@@ -1022,6 +1423,34 @@ class Orchestrator:
             verdict=raw.get("verdict", "reject"),
             reason=raw.get("reason", ""),
             follow_up=raw.get("follow_up", ""),
+        )
+
+    def _blocker_from_dict(self, raw: dict[str, Any]) -> BlockerInfo:
+        escalation = raw.get("escalation")
+        return BlockerInfo(
+            kind=raw.get("kind", "blocked"),
+            recoverable=raw.get("recoverable", True),
+            details=raw.get("details", ""),
+            needs_user_input=raw.get("needs_user_input", False),
+            owner=raw.get("owner", "node"),
+            urgency=raw.get("urgency", "normal"),
+            escalation=EscalationInfo(
+                kind=escalation.get("kind", raw.get("kind", "blocked")),
+                summary=escalation.get("summary", raw.get("details", "")),
+                details=escalation.get("details", raw.get("details", "")),
+                action_requested=escalation.get("action_requested", ""),
+            ) if escalation else None,
+        )
+
+    def _request_from_dict(self, raw: dict[str, Any]) -> UpstreamRequest:
+        return UpstreamRequest(
+            kind=raw.get("kind", "clarification"),
+            summary=raw.get("summary", raw.get("details", "")),
+            details=raw.get("details", ""),
+            action_requested=raw.get("action_requested", ""),
+            requires_input=raw.get("requires_input", raw.get("needs_user_input", False)),
+            urgency=raw.get("urgency", "normal"),
+            request_id=raw.get("request_id", ""),
         )
 
 
