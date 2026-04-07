@@ -54,6 +54,7 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     },
     NodeState.WAITING_ON_CHILDREN: {
         NodeState.REVIEWING_CHILDREN,
+        NodeState.PAUSED,
         NodeState.FAILED,
         NodeState.CANCELLED,
     },
@@ -80,6 +81,7 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
     NodeState.PAUSED: {
         NodeState.PLANNING,  # resume with new input
         NodeState.EXECUTING,  # resume for follow-up work
+        NodeState.WAITING_ON_CHILDREN,  # resume after forwarding a child request response
         NodeState.COMPLETED,  # user says "done"
         NodeState.CANCELLED,
     },
@@ -126,6 +128,7 @@ class RunRecord:
     pass_count: int = 1
     persistent: bool = False
     test_command: str | None = None
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -164,7 +167,8 @@ class StateStore:
                 status TEXT NOT NULL DEFAULT 'running',
                 pass_count INTEGER NOT NULL DEFAULT 1,
                 persistent INTEGER NOT NULL DEFAULT 0,
-                test_command TEXT
+                test_command TEXT,
+                telemetry TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS nodes (
@@ -222,6 +226,7 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS idx_domain_child ON domain_registry(child_node_id);
         """)
         self._ensure_column("runs", "test_command", "TEXT")
+        self._ensure_column("runs", "telemetry", "TEXT NOT NULL DEFAULT '{}'")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -242,15 +247,17 @@ class StateStore:
     ) -> RunRecord:
         run_id = _new_id("run")
         now = _now()
+        telemetry = _default_run_telemetry()
         self._conn.execute(
-            "INSERT INTO runs (run_id, repo_root, task, created_at, status, persistent, test_command) VALUES (?, ?, ?, ?, 'running', ?, ?)",
-            (run_id, repo_root, task, now, 1 if persistent else 0, test_command),
+            "INSERT INTO runs (run_id, repo_root, task, created_at, status, persistent, test_command, telemetry) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
+            (run_id, repo_root, task, now, 1 if persistent else 0, test_command, json.dumps(telemetry)),
         )
         self._conn.commit()
         return RunRecord(
             run_id=run_id, repo_root=repo_root, task=task, root_node_id=None,
             created_at=now, finished_at=None, status="running",
             pass_count=1, persistent=persistent, test_command=test_command,
+            telemetry=telemetry,
         )
 
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -284,6 +291,34 @@ class StateStore:
     def set_root_node(self, run_id: str, node_id: str) -> None:
         self._conn.execute(
             "UPDATE runs SET root_node_id = ? WHERE run_id = ?", (node_id, run_id),
+        )
+        self._conn.commit()
+
+    def update_run_telemetry(self, run_id: str, **fields: int | float) -> None:
+        run = self.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run {run_id} not found")
+        telemetry = dict(_default_run_telemetry())
+        telemetry.update(run.telemetry)
+        telemetry.update(fields)
+        self._conn.execute(
+            "UPDATE runs SET telemetry = ? WHERE run_id = ?",
+            (json.dumps(telemetry), run_id),
+        )
+        self._conn.commit()
+
+    def increment_run_telemetry(self, run_id: str, **increments: int | float) -> None:
+        run = self.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run {run_id} not found")
+        telemetry = dict(_default_run_telemetry())
+        telemetry.update(run.telemetry)
+        for key, value in increments.items():
+            current = telemetry.get(key, 0)
+            telemetry[key] = current + value
+        self._conn.execute(
+            "UPDATE runs SET telemetry = ? WHERE run_id = ?",
+            (json.dumps(telemetry), run_id),
         )
         self._conn.commit()
 
@@ -403,6 +438,265 @@ class StateStore:
         ).fetchall()
         return [_row_to_event(r) for r in rows]
 
+    def get_latest_blocker(self, node_id: str) -> dict[str, Any] | None:
+        """Return the latest structured blocker/escalation for a node."""
+        request = self.get_latest_request(node_id)
+        if request is not None:
+            blocker = request["request"]
+            return {
+                **request,
+                "blocker": {
+                    "kind": blocker.get("kind", "request"),
+                    "details": blocker.get("details", ""),
+                    "urgency": blocker.get("urgency", "normal"),
+                    "escalation": {
+                        "summary": blocker.get("summary", ""),
+                        "details": blocker.get("details", ""),
+                        "action_requested": blocker.get("action_requested", ""),
+                    },
+                },
+            }
+        return None
+
+    def get_latest_request(self, node_id: str) -> dict[str, Any] | None:
+        """Return the latest structured upstream request for a node."""
+        events = self.get_node_events(node_id)
+        for event in reversed(events):
+            if event.event_type in {
+                "root_request_upstream",
+                "request_forwarded_upstream",
+                "request_upstream",
+                "root_escalation_requested",
+                "child_escalation_forwarded",
+                "user_escalation_requested",
+            }:
+                request = event.data.get("request")
+                if request:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": request,
+                        "source_child_id": event.data.get("source_child_id"),
+                        "source_task_spec": event.data.get("source_task_spec"),
+                    }
+                blocker = event.data.get("blocker")
+                if blocker:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": {
+                            "kind": blocker.get("kind", "request"),
+                            "summary": blocker.get("escalation", {}).get("summary", blocker.get("details", "")),
+                            "details": blocker.get("details", ""),
+                            "action_requested": blocker.get("escalation", {}).get("action_requested", ""),
+                            "requires_input": blocker.get("needs_user_input", False),
+                            "urgency": blocker.get("urgency", "normal"),
+                        },
+                        "source_child_id": event.data.get("source_child_id"),
+                        "source_task_spec": event.data.get("source_task_spec"),
+                    }
+            if event.event_type == "execution_result":
+                raw = event.data.get("raw", {})
+                request = raw.get("request")
+                if raw.get("status") == "request_upstream" and request:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": request,
+                        "source_child_id": None,
+                        "source_task_spec": None,
+                    }
+                blocker = raw.get("blocker")
+                if raw.get("status") == "blocked" and blocker:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": {
+                            "kind": blocker.get("kind", "request"),
+                            "summary": blocker.get("escalation", {}).get("summary", blocker.get("details", "")),
+                            "details": blocker.get("details", ""),
+                            "action_requested": blocker.get("escalation", {}).get("action_requested", ""),
+                            "requires_input": blocker.get("needs_user_input", False),
+                            "urgency": blocker.get("urgency", "normal"),
+                        },
+                        "source_child_id": None,
+                        "source_task_spec": None,
+                    }
+            if event.event_type == "state_transition":
+                request = event.data.get("request")
+                if request:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": request,
+                        "source_child_id": event.data.get("source_child_id"),
+                        "source_task_spec": None,
+                    }
+                blocker = event.data.get("blocker")
+                if blocker:
+                    return {
+                        "event_type": event.event_type,
+                        "timestamp": event.timestamp,
+                        "request": {
+                            "kind": blocker.get("kind", "request"),
+                            "summary": blocker.get("escalation", {}).get("summary", blocker.get("details", "")),
+                            "details": blocker.get("details", ""),
+                            "action_requested": blocker.get("escalation", {}).get("action_requested", ""),
+                            "requires_input": blocker.get("needs_user_input", False),
+                            "urgency": blocker.get("urgency", "normal"),
+                        },
+                        "source_child_id": event.data.get("source_child_id"),
+                        "source_task_spec": None,
+                    }
+        return None
+
+    def get_run_blockers(self, run_id: str) -> list[dict[str, Any]]:
+        """Return active blockers for paused/failed nodes in a run."""
+        requests = self.get_run_requests(run_id)
+        blockers: list[dict[str, Any]] = []
+        for request in requests:
+            req = request["request"]
+            blockers.append({
+                **request,
+                "blocker": {
+                    "kind": req.get("kind", "request"),
+                    "details": req.get("details", ""),
+                    "urgency": req.get("urgency", "normal"),
+                    "escalation": {
+                        "summary": req.get("summary", ""),
+                        "details": req.get("details", ""),
+                        "action_requested": req.get("action_requested", ""),
+                    },
+                },
+            })
+        return blockers
+
+    def get_run_requests(self, run_id: str) -> list[dict[str, Any]]:
+        """Return active upstream requests for paused/failed nodes in a run."""
+        blockers: list[dict[str, Any]] = []
+        for node in self.get_run_nodes(run_id):
+            if node.state not in {NodeState.PAUSED, NodeState.FAILED}:
+                continue
+            latest = self.get_latest_request(node.node_id)
+            if latest is None:
+                continue
+            domain = self.get_domain_by_child(node.node_id)
+            blockers.append({
+                "node_id": node.node_id,
+                "parent_id": node.parent_id,
+                "task_spec": node.task_spec,
+                "state": node.state.value,
+                "domain_name": domain.domain_name if domain else None,
+                **latest,
+            })
+        blockers.sort(key=lambda item: item["timestamp"], reverse=True)
+        return blockers
+
+    def get_latest_downstream_task(self, node_id: str) -> dict[str, Any] | None:
+        """Return the latest unresolved downstream work item for a node."""
+        pending: dict[str, Any] | None = None
+        for event in self.get_node_events(node_id):
+            if event.event_type == "downstream_task":
+                pending = {
+                    "event_type": event.event_type,
+                    "timestamp": event.timestamp,
+                    "task": event.data,
+                }
+            elif event.event_type == "reactivation_requested":
+                pending = {
+                    "event_type": event.event_type,
+                    "timestamp": event.timestamp,
+                    "task": {
+                        "kind": "reactivation",
+                        "summary": "Follow-up work routed from parent",
+                        "task_spec": event.data.get("new_task", ""),
+                        "previous_summary": event.data.get("previous_summary", ""),
+                        "original_task": event.data.get("original_task", ""),
+                    },
+                }
+            elif event.event_type == "revision_requested":
+                pending = {
+                    "event_type": event.event_type,
+                    "timestamp": event.timestamp,
+                    "task": {
+                        "kind": "revision",
+                        "summary": "Review requested changes",
+                        "task_spec": event.data.get("follow_up", ""),
+                    },
+                }
+            elif event.event_type in {"execution_result", "downstream_task_result"}:
+                pending = None
+        return pending
+
+    def get_run_downstream_tasks(self, run_id: str) -> list[dict[str, Any]]:
+        """Return unresolved downstream work items across the run tree."""
+        tasks: list[dict[str, Any]] = []
+        for node in self.get_run_nodes(run_id):
+            latest = self.get_latest_downstream_task(node.node_id)
+            if latest is None:
+                continue
+            domain = self.get_domain_by_child(node.node_id)
+            tasks.append({
+                "node_id": node.node_id,
+                "parent_id": node.parent_id,
+                "task_spec": node.task_spec,
+                "state": node.state.value,
+                "domain_name": domain.domain_name if domain else None,
+                **latest,
+            })
+        tasks.sort(key=lambda item: item["timestamp"], reverse=True)
+        return tasks
+
+    def get_run_inbox(self, run_id: str) -> list[dict[str, Any]]:
+        """Return unresolved root-facing requests for a run."""
+        requests_by_id: dict[str, dict[str, Any]] = {}
+        resolved_ids: set[str] = set()
+
+        for event in self.get_run_events(run_id):
+            if event.event_type == "root_request_upstream":
+                request = event.data.get("request")
+                if not request:
+                    continue
+                request_id = request.get("request_id")
+                if not request_id:
+                    continue
+                source_child_id = event.data.get("source_child_id")
+                domain_name = None
+                if source_child_id:
+                    domain = self.get_domain_by_child(source_child_id)
+                    domain_name = domain.domain_name if domain else None
+                source_task_spec = None
+                if source_child_id:
+                    source_node = self.get_node(source_child_id)
+                    source_task_spec = source_node.task_spec if source_node else None
+                requests_by_id[request_id] = {
+                    "request_id": request_id,
+                    "timestamp": event.timestamp,
+                    "request": request,
+                    "source_child_id": source_child_id,
+                    "source_task_spec": source_task_spec,
+                    "domain_name": domain_name,
+                    "node_id": event.node_id,
+                }
+            elif event.event_type == "request_resolved":
+                request_id = event.data.get("request_id")
+                if request_id:
+                    resolved_ids.add(request_id)
+
+        inbox = [
+            item for request_id, item in requests_by_id.items()
+            if request_id not in resolved_ids
+        ]
+        inbox.sort(key=lambda item: item["timestamp"], reverse=True)
+        return inbox
+
+    def get_inbox_request(self, run_id: str, request_id: str) -> dict[str, Any] | None:
+        """Return a single unresolved root-facing request by id."""
+        for item in self.get_run_inbox(run_id):
+            if item["request_id"] == request_id:
+                return item
+        return None
+
     # --- Sessions ---
 
     def create_session(self, session_id: str, node_id: str, adapter: str) -> None:
@@ -519,16 +813,24 @@ def _row_to_node(row: sqlite3.Row) -> NodeRecord:
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     # test_command column may not exist in older databases
     test_command = None
+    telemetry: dict[str, Any] = {}
     try:
         test_command = row["test_command"]
     except (IndexError, KeyError):
         pass
+    try:
+        raw_telemetry = row["telemetry"]
+        telemetry = json.loads(raw_telemetry) if raw_telemetry else {}
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        telemetry = {}
+    merged_telemetry = _default_run_telemetry()
+    merged_telemetry.update(telemetry)
     return RunRecord(
         run_id=row["run_id"], repo_root=row["repo_root"], task=row["task"],
         root_node_id=row["root_node_id"], created_at=row["created_at"],
         finished_at=row["finished_at"], status=row["status"],
         pass_count=row["pass_count"], persistent=bool(row["persistent"]),
-        test_command=test_command,
+        test_command=test_command, telemetry=merged_telemetry,
     )
 
 
@@ -548,3 +850,14 @@ def _row_to_domain(row: sqlite3.Row) -> DomainRecord:
         module_scope=row["module_scope"], created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _default_run_telemetry() -> dict[str, Any]:
+    return {
+        "user_interruptions_count": 0,
+        "root_escalations_count": 0,
+        "root_requests_count": 0,
+        "resolved_requests_count": 0,
+        "human_inputs_count": 0,
+        "ownership_violations_count": 0,
+    }

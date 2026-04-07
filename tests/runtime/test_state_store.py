@@ -21,10 +21,12 @@ class TestRuns:
         run = store.create_run("/tmp/repo", "fix the bug")
         assert run.run_id.startswith("run-")
         assert run.status == "running"
+        assert run.telemetry["user_interruptions_count"] == 0
 
         fetched = store.get_run(run.run_id)
         assert fetched is not None
         assert fetched.task == "fix the bug"
+        assert fetched.telemetry["root_escalations_count"] == 0
 
     def test_finish_run(self, store):
         run = store.create_run("/tmp/repo", "task")
@@ -65,8 +67,20 @@ class TestRuns:
             fetched = store.get_run(run.run_id)
             assert fetched is not None
             assert fetched.test_command == "pytest"
+            assert fetched.telemetry["human_inputs_count"] == 0
         finally:
             store.close()
+
+    def test_increment_run_telemetry(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        store.increment_run_telemetry(
+            run.run_id,
+            user_interruptions_count=1,
+            root_escalations_count=2,
+        )
+        fetched = store.get_run(run.run_id)
+        assert fetched.telemetry["user_interruptions_count"] == 1
+        assert fetched.telemetry["root_escalations_count"] == 2
 
 
 class TestNodes:
@@ -190,6 +204,185 @@ class TestEvents:
         n2 = store.create_node(run.run_id, "t2")
         events = store.get_run_events(run.run_id)
         assert len(events) == 2  # two node_created events
+
+    def test_get_latest_blocker_from_escalation_event(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "subtask")
+        store.transition_node(node.node_id, NodeState.PLANNING)
+        store.transition_node(node.node_id, NodeState.EXECUTING)
+        store.transition_node(node.node_id, NodeState.PAUSED, {
+            "blocker": {"kind": "missing_credentials", "details": "need key"},
+        })
+        store.append_event(run.run_id, node.node_id, "root_escalation_requested", {
+            "blocker": {"kind": "missing_credentials", "details": "need key"},
+        })
+
+        blocker = store.get_latest_blocker(node.node_id)
+        assert blocker is not None
+        assert blocker["blocker"]["kind"] == "missing_credentials"
+
+    def test_get_latest_request_from_request_event(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "subtask")
+        store.transition_node(node.node_id, NodeState.PLANNING)
+        store.transition_node(node.node_id, NodeState.EXECUTING)
+        store.transition_node(node.node_id, NodeState.PAUSED, {
+            "request": {"kind": "clarification", "summary": "Need API choice"},
+        })
+        store.append_event(run.run_id, node.node_id, "root_request_upstream", {
+            "request": {"kind": "clarification", "summary": "Need API choice"},
+        })
+
+        request = store.get_latest_request(node.node_id)
+        assert request is not None
+        assert request["request"]["kind"] == "clarification"
+        assert request["request"]["summary"] == "Need API choice"
+
+    def test_get_run_blockers_filters_active_nodes(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        paused = store.create_node(run.run_id, "paused task")
+        done = store.create_node(run.run_id, "done task")
+
+        store.transition_node(paused.node_id, NodeState.PLANNING)
+        store.transition_node(paused.node_id, NodeState.EXECUTING)
+        store.transition_node(paused.node_id, NodeState.PAUSED, {
+            "blocker": {"kind": "needs_input", "details": "question"},
+        })
+
+        store.transition_node(done.node_id, NodeState.PLANNING)
+        store.transition_node(done.node_id, NodeState.EXECUTING)
+        store.transition_node(done.node_id, NodeState.COMPLETED)
+
+        blockers = store.get_run_blockers(run.run_id)
+        assert len(blockers) == 1
+        assert blockers[0]["node_id"] == paused.node_id
+
+    def test_get_run_requests_filters_active_nodes(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        paused = store.create_node(run.run_id, "paused task")
+        store.transition_node(paused.node_id, NodeState.PLANNING)
+        store.transition_node(paused.node_id, NodeState.EXECUTING)
+        store.transition_node(paused.node_id, NodeState.PAUSED, {
+            "request": {"kind": "capability", "summary": "Need Stripe key"},
+        })
+
+        requests = store.get_run_requests(run.run_id)
+        assert len(requests) == 1
+        assert requests[0]["request"]["kind"] == "capability"
+
+    def test_get_run_inbox_tracks_unresolved_root_requests(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        child = store.create_node(run.run_id, "child task", parent_id=root.node_id)
+        store.set_root_node(run.run_id, root.node_id)
+
+        request = {
+            "request_id": "req-123",
+            "kind": "capability",
+            "summary": "Need Stripe API key",
+            "action_requested": "Add a Stripe test key",
+        }
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": request,
+            "source_child_id": child.node_id,
+        })
+
+        inbox = store.get_run_inbox(run.run_id)
+        assert len(inbox) == 1
+        assert inbox[0]["request_id"] == "req-123"
+        assert inbox[0]["request"]["summary"] == "Need Stripe API key"
+        assert inbox[0]["source_child_id"] == child.node_id
+        assert inbox[0]["source_task_spec"] == "child task"
+
+    def test_get_run_inbox_hides_resolved_requests(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        store.set_root_node(run.run_id, root.node_id)
+
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-123",
+                "kind": "clarification",
+                "summary": "Need product choice",
+            },
+        })
+        store.append_event(run.run_id, root.node_id, "request_resolved", {
+            "request_id": "req-123",
+        })
+
+        assert store.get_run_inbox(run.run_id) == []
+
+    def test_get_inbox_request_returns_specific_unresolved_item(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        store.set_root_node(run.run_id, root.node_id)
+
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-123",
+                "kind": "clarification",
+                "summary": "Need copy direction",
+            },
+        })
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-456",
+                "kind": "capability",
+                "summary": "Need API key",
+            },
+        })
+
+        item = store.get_inbox_request(run.run_id, "req-456")
+        assert item is not None
+        assert item["request"]["kind"] == "capability"
+        assert store.get_inbox_request(run.run_id, "req-missing") is None
+
+    def test_get_latest_downstream_task_tracks_unresolved_work(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "child task")
+        store.append_event(run.run_id, node.node_id, "downstream_task", {
+            "kind": "revision",
+            "summary": "Need tests",
+            "task_spec": "add tests",
+        })
+
+        task = store.get_latest_downstream_task(node.node_id)
+        assert task is not None
+        assert task["task"]["kind"] == "revision"
+        assert task["task"]["task_spec"] == "add tests"
+
+    def test_get_latest_downstream_task_clears_after_result(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "child task")
+        store.append_event(run.run_id, node.node_id, "downstream_task", {
+            "kind": "merge_conflict",
+            "summary": "Resolve conflict",
+        })
+        store.append_event(run.run_id, node.node_id, "downstream_task_result", {
+            "kind": "merge_conflict",
+            "status": "completed",
+        })
+
+        assert store.get_latest_downstream_task(node.node_id) is None
+
+    def test_get_run_downstream_tasks_returns_all_unresolved_items(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        first = store.create_node(run.run_id, "first task")
+        second = store.create_node(run.run_id, "second task")
+        store.append_event(run.run_id, first.node_id, "downstream_task", {
+            "kind": "revision",
+            "summary": "Fix tests",
+            "task_spec": "add tests",
+        })
+        store.append_event(run.run_id, second.node_id, "reactivation_requested", {
+            "new_task": "add auth",
+            "previous_summary": "built api",
+            "original_task": "build api",
+        })
+
+        tasks = store.get_run_downstream_tasks(run.run_id)
+        assert len(tasks) == 2
+        assert {item["task"]["kind"] for item in tasks} == {"revision", "reactivation"}
 
 
 class TestIdempotency:

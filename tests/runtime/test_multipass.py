@@ -46,7 +46,9 @@ class ScriptedAdapter(AgentAdapter):
 
 
 def _make_commit(worktree: Path, filename: str, message: str) -> None:
-    (worktree / filename).write_text(f"content of {filename}\n")
+    target = worktree / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"content of {filename}\n")
     subprocess.run(["git", "add", "."], cwd=str(worktree), capture_output=True)
     subprocess.run(["git", "commit", "-m", message], cwd=str(worktree), capture_output=True)
 
@@ -86,7 +88,7 @@ class TestPersistentRun:
             # Child plans + executes
             {"action": "solve_directly", "rationale": "ok"},
             {"status": "implemented", "summary": "built auth",
-             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth"},
+             "_commit": True, "_commit_file": "src/auth/auth.py", "_commit_msg": "auth"},
             # Root reviews: accept
             {"verdict": "accept", "reason": "ok"},
         ])
@@ -119,13 +121,13 @@ class TestPersistentRun:
              "children": [
                  {"idempotency_key": "auth", "objective": "build auth",
                   "success_criteria": ["works"],
-                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "domain_name": "auth", "file_patterns": ["src/auth/**"],
                   "module_scope": "Auth module"},
              ]},
             # Auth child: plan + execute
             {"action": "solve_directly", "rationale": "ok"},
             {"status": "implemented", "summary": "built auth",
-             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+             "_commit": True, "_commit_file": "src/auth/auth.py", "_commit_msg": "auth v1"},
             # Root reviews: accept
             {"verdict": "accept", "reason": "ok"},
 
@@ -136,7 +138,7 @@ class TestPersistentRun:
                          "task_spec": "add password hashing"}]},
             # Auth child re-executes
             {"status": "implemented", "summary": "added hashing",
-             "_commit": True, "_commit_file": "hashing.py", "_commit_msg": "add hashing"},
+             "_commit": True, "_commit_file": "src/auth/hashing.py", "_commit_msg": "add hashing"},
             # Root reviews reactivated child: accept
             {"verdict": "accept", "reason": "ok"},
         ])
@@ -176,14 +178,16 @@ class TestPersistentRun:
         exec_events = [e for e in child_events if e.event_type == "execution_result"]
         assert len(exec_events) == 2  # original + reactivation
 
-        reactivation_events = [e for e in child_events if e.event_type == "reactivation_requested"]
-        assert len(reactivation_events) == 1
+        downstream_tasks = [e for e in child_events if e.event_type == "downstream_task"]
+        assert len(downstream_tasks) == 1
+        assert downstream_tasks[0].data["kind"] == "reactivation"
+        assert downstream_tasks[0].data["task_spec"] == "add password hashing"
 
         # Root worktree should have both files
         root = store.get_node(run.root_node_id)
         root_wt = Path(root.worktree_path)
-        assert (root_wt / "auth.py").exists()
-        assert (root_wt / "hashing.py").exists()
+        assert (root_wt / "src/auth/auth.py").exists()
+        assert (root_wt / "src/auth/hashing.py").exists()
         store.close()
 
     @pytest.mark.asyncio
@@ -193,20 +197,20 @@ class TestPersistentRun:
              "children": [
                  {"idempotency_key": "auth", "objective": "build auth",
                   "success_criteria": ["works"],
-                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "domain_name": "auth", "file_patterns": ["src/auth/**"],
                   "module_scope": "Auth module"},
              ],
              "_session_id": "root-plan"},
             {"action": "solve_directly", "rationale": "ok", "_session_id": "child-plan"},
             {"status": "implemented", "summary": "built auth",
-             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+             "_commit": True, "_commit_file": "src/auth/auth.py", "_commit_msg": "auth v1"},
             {"verdict": "accept", "reason": "ok", "_session_id": "root-review"},
             {"action": "route_to_children", "rationale": "auth domain",
              "routes": [{"child_node_id": "PLACEHOLDER", "domain_name": "auth",
                          "task_spec": "add password hashing"}],
              "_session_id": "root-review"},
             {"status": "implemented", "summary": "added hashing",
-             "_commit": True, "_commit_file": "hashing.py", "_commit_msg": "add hashing"},
+             "_commit": True, "_commit_file": "src/auth/hashing.py", "_commit_msg": "add hashing"},
             {"verdict": "accept", "reason": "ok"},
         ])
 
@@ -308,10 +312,10 @@ class TestDomainRegistry:
              ]},
             {"action": "solve_directly", "rationale": "ok"},
             {"status": "implemented", "summary": "fe done",
-             "_commit": True, "_commit_file": "ui.txt", "_commit_msg": "fe"},
+             "_commit": True, "_commit_file": "src/ui/index.tsx", "_commit_msg": "fe"},
             {"action": "solve_directly", "rationale": "ok"},
             {"status": "implemented", "summary": "be done",
-             "_commit": True, "_commit_file": "api.txt", "_commit_msg": "be"},
+             "_commit": True, "_commit_file": "src/api/server.ts", "_commit_msg": "be"},
             {"verdict": "accept", "reason": "ok"},
             {"verdict": "accept", "reason": "ok"},
         ])

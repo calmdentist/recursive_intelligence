@@ -9,8 +9,32 @@ You are a node in a recursive coding-agent runtime. You work in an isolated git 
 
 - Solve small tasks directly. Decompose large tasks into children with independent file scopes.
 - Commit your work before finishing.
+- If you need clarification, credentials, third-party signup, or approval, send a typed request upstream.
+- Child nodes must never ask the user directly. They send requests to their parent. Only the root may surface user-facing requests.
 - End each phase with a single JSON object. No wrapping text or markdown around it.
 """
+
+
+def _request_upstream_schema(is_root: bool) -> str:
+    user_line = (
+        "If you need user action, return a `request_upstream` result with `requires_input: true`."
+        if is_root
+        else "Do not ask the user directly. If you need user action, return a `request_upstream` result for your parent or the root."
+    )
+    return f"""\
+If you need something from upstream:
+{user_line}
+{{
+  "status": "request_upstream",
+  "request": {{
+    "kind": "...",
+    "summary": "...",
+    "details": "...",
+    "action_requested": "...",
+    "requires_input": true,
+    "urgency": "normal"
+  }}
+}}"""
 
 
 def planning_prompt(task_spec: str, file_scope: list[str] | None = None) -> str:
@@ -47,7 +71,7 @@ Split into children (give each child a distinct file scope):
 """
 
 
-def execution_prompt(task_spec: str) -> str:
+def execution_prompt(task_spec: str, is_root: bool = False) -> str:
     return f"""\
 ## Task
 {task_spec}
@@ -57,8 +81,7 @@ Implement this task. Commit when done.
 On success:
 {{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
 
-If blocked:
-{{"status": "blocked", "kind": "...", "recoverable": true, "details": "..."}}
+{_request_upstream_schema(is_root)}
 """
 
 
@@ -82,13 +105,15 @@ Respond with one of:
 """
 
 
-def revision_prompt(follow_up: str) -> str:
+def revision_prompt(follow_up: str, is_root: bool = False) -> str:
     return f"""\
 Revision requested. Make these changes, commit, and return the result.
 
 Feedback: {follow_up}
 
 {{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+
+{_request_upstream_schema(is_root)}
 """
 
 
@@ -135,7 +160,9 @@ Done:
 """
 
 
-def reactivation_prompt(original_task: str, previous_summary: str, new_task: str) -> str:
+def reactivation_prompt(
+    original_task: str, previous_summary: str, new_task: str, is_root: bool = False,
+) -> str:
     """Re-activate a child with follow-up work."""
 
     return f"""\
@@ -146,6 +173,42 @@ New task: {new_task}
 
 Implement the changes, commit, and return:
 {{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+
+{_request_upstream_schema(is_root)}
+"""
+
+
+def downstream_response_prompt(
+    request_summary: str,
+    response_text: str,
+    original_details: str = "",
+    resolution: str = "answer",
+    is_root: bool = False,
+) -> str:
+    resolution_label = {
+        "approve": "Approval from upstream",
+        "decline": "Decline from upstream",
+        "answer": "Response from upstream",
+    }.get(resolution, "Response from upstream")
+
+    return f"""\
+You previously sent an upstream request.
+
+## Request summary
+{request_summary}
+
+## Original details
+{original_details or "(none)"}
+
+## {resolution_label}
+{response_text}
+
+Use this response to continue the task. Commit when done.
+
+On success:
+{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+
+{_request_upstream_schema(is_root)}
 """
 
 

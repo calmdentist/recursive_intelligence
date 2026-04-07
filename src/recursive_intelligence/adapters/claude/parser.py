@@ -62,7 +62,15 @@ def parse_plan_decision(text: str) -> dict[str, Any]:
     data = extract_json(text)
     if "action" not in data:
         raise ParseError(f"Plan decision missing 'action' field: {data}")
-    valid_actions = {"solve_directly", "spawn_children", "review_children", "integrate_and_finish"}
+    valid_actions = {
+        "solve_directly",
+        "spawn_children",
+        "route_to_children",
+        "review_children",
+        "integrate_and_finish",
+        "pause",
+        "done",
+    }
     if data["action"] not in valid_actions:
         raise ParseError(f"Unknown plan action: {data['action']}. Expected one of: {valid_actions}")
     return data

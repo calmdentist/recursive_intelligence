@@ -50,6 +50,7 @@ class ExecutionResult:
     summary: str = ""
     changed_files: list[str] | None = None
     commit_sha: str | None = None
+    request: UpstreamRequest | None = None
     blocker: BlockerInfo | None = None
 
 
@@ -64,10 +65,33 @@ class ReviewVerdict:
 
 
 @dataclass
+class UpstreamRequest:
+    kind: str
+    summary: str
+    details: str = ""
+    action_requested: str = ""
+    requires_input: bool = False
+    urgency: str = "normal"
+    request_id: str = ""
+
+
+@dataclass
+class EscalationInfo:
+    kind: str
+    summary: str
+    details: str = ""
+    action_requested: str = ""
+
+
+@dataclass
 class BlockerInfo:
     kind: str
     recoverable: bool = True
     details: str = ""
+    needs_user_input: bool = False
+    owner: str = "node"
+    urgency: str = "normal"
+    escalation: EscalationInfo | None = None
 
 
 def child_spawn_dedupe_key(parent_id: str, slot: str, task_spec: str) -> str:
@@ -135,12 +159,16 @@ class NodeFSM:
 
         if result.status == "blocked":
             if result.blocker:
-                data["blocker"] = {
-                    "kind": result.blocker.kind,
-                    "recoverable": result.blocker.recoverable,
-                    "details": result.blocker.details,
-                }
-            return self.store.transition_node(self.node_id, NodeState.FAILED, data)
+                data["blocker"] = blocker_to_dict(result.blocker)
+                if result.blocker.needs_user_input:
+                    data["request"] = blocker_to_request_dict(result.blocker)
+            next_state = NodeState.PAUSED if result.blocker and result.blocker.needs_user_input else NodeState.FAILED
+            return self.store.transition_node(self.node_id, next_state, data)
+
+        if result.status == "request_upstream":
+            if result.request:
+                data["request"] = request_to_dict(result.request)
+            return self.store.transition_node(self.node_id, NodeState.PAUSED, data)
 
         next_state = NodeState.VERIFYING if verify else NodeState.COMPLETED
         return self.store.transition_node(self.node_id, next_state, data)
@@ -276,3 +304,53 @@ class NodeFSM:
             )
 
         return child
+
+
+def escalation_to_dict(escalation: EscalationInfo) -> dict[str, Any]:
+    return {
+        "kind": escalation.kind,
+        "summary": escalation.summary,
+        "details": escalation.details,
+        "action_requested": escalation.action_requested,
+    }
+
+
+def request_to_dict(request: UpstreamRequest) -> dict[str, Any]:
+    return {
+        "kind": request.kind,
+        "summary": request.summary,
+        "details": request.details,
+        "action_requested": request.action_requested,
+        "requires_input": request.requires_input,
+        "urgency": request.urgency,
+        "request_id": request.request_id,
+    }
+
+
+def blocker_to_dict(blocker: BlockerInfo) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "kind": blocker.kind,
+        "recoverable": blocker.recoverable,
+        "details": blocker.details,
+        "needs_user_input": blocker.needs_user_input,
+        "owner": blocker.owner,
+        "urgency": blocker.urgency,
+    }
+    if blocker.escalation:
+        data["escalation"] = escalation_to_dict(blocker.escalation)
+    return data
+
+
+def blocker_to_request_dict(blocker: BlockerInfo) -> dict[str, Any]:
+    summary = blocker.escalation.summary if blocker.escalation else blocker.details or blocker.kind
+    action_requested = blocker.escalation.action_requested if blocker.escalation else ""
+    details = blocker.escalation.details if blocker.escalation else blocker.details
+    return {
+        "kind": blocker.kind,
+        "summary": summary,
+        "details": details,
+        "action_requested": action_requested,
+        "requires_input": blocker.needs_user_input,
+        "urgency": blocker.urgency,
+        "request_id": "",
+    }

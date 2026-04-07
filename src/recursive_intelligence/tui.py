@@ -120,7 +120,10 @@ class RariApp(App):
                 yield Tree("nodes", id="node-tree")
                 yield RichLog(id="detail", wrap=True, highlight=True, markup=True)
         yield Static("", id="status-bar")
-        yield Input(placeholder="type a task, or /tree /domains /status /help /quit", id="prompt")
+        yield Input(
+            placeholder="type a task, or /tree /inbox /work /status /answer <id> ... /help /quit",
+            id="prompt",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -159,7 +162,9 @@ class RariApp(App):
         self._run_task(text)
 
     def _handle_command(self, cmd: str) -> None:
-        cmd = cmd.strip().lower()
+        raw = cmd.strip()
+        name, _, _ = raw.partition(" ")
+        cmd = name.lower()
         output = self.query_one("#output", RichLog)
 
         if cmd in ("/quit", "/q", "/exit"):
@@ -174,6 +179,44 @@ class RariApp(App):
 
         if cmd in ("/domains", "/d"):
             self._show_domains()
+            return
+
+        if cmd in ("/blockers", "/b", "/requests", "/r"):
+            self._show_blockers()
+            return
+
+        if cmd in ("/inbox", "/i"):
+            self._show_inbox()
+            return
+
+        if cmd in ("/work", "/tasks", "/w"):
+            self._show_work_items()
+            return
+
+        request_action = self._parse_request_action(raw)
+        if request_action is not None:
+            action, request_id, response_text = request_action
+            if not self.run_id:
+                output.write("[dim]no active run[/]")
+                return
+            if self._busy:
+                output.write("[dim]cannot resolve a request while work is still running[/]")
+                return
+            if not request_id:
+                output.write(f"[dim]usage: {action} <request_id> <response>[/]")
+                return
+            resolution = {
+                "/answer": "answer",
+                "/approve": "approve",
+                "/decline": "decline",
+            }[action]
+            try:
+                normalized = self._resolution_text(resolution, response_text)
+            except ValueError as e:
+                output.write(f"[red]error[/] {e}")
+                return
+            output.write(f"[dim]resolving {request_id} ({resolution})...[/]")
+            self._resolve_request(request_id, normalized, resolution)
             return
 
         if cmd in ("/status", "/s"):
@@ -193,6 +236,13 @@ class RariApp(App):
         if cmd == "/help":
             output.write("[bold]/tree[/]     [dim]show/refresh the node tree[/]")
             output.write("[bold]/domains[/]  [dim]show domain registry[/]")
+            output.write("[bold]/inbox[/]    [dim]show unresolved root-inbox requests[/]")
+            output.write("[bold]/work[/]     [dim]show unresolved downstream work items[/]")
+            output.write("[bold]/answer[/]   [dim]answer a request: /answer <id> <text>[/]")
+            output.write("[bold]/approve[/]  [dim]approve a request: /approve <id> [note][/]")
+            output.write("[bold]/decline[/]  [dim]decline a request: /decline <id> [reason][/]")
+            output.write("[bold]/requests[/] [dim]show active upstream requests[/]")
+            output.write("[bold]/blockers[/] [dim]legacy alias for /requests[/]")
             output.write("[bold]/status[/]   [dim]show run status[/]")
             output.write("[bold]/done[/]     [dim]finalize and exit[/]")
             output.write("[bold]/quit[/]     [dim]exit (run stays paused)[/]")
@@ -220,6 +270,38 @@ class RariApp(App):
                 self.run_id = asyncio.run(orch.start_run(task, persistent=True))
             else:
                 asyncio.run(orch.continue_run(self.run_id, task))
+
+            self.call_from_thread(self._on_pass_complete)
+        except Exception as e:
+            self.call_from_thread(self._on_error, str(e))
+        finally:
+            self._busy = False
+            self._update_status("")
+
+    @work(thread=True)
+    def _resolve_request(self, request_id: str, response_text: str, resolution: str) -> None:
+        """Resolve a specific inbox request in a background thread."""
+        self._busy = True
+        self._update_status(f"resolving {request_id}...")
+
+        try:
+            from recursive_intelligence.adapters.claude.adapter import ClaudeAdapter
+
+            adapter = ClaudeAdapter(model=self.model)
+            orch = Orchestrator(self.ri_config, adapter, on_message=self._on_stream_message)
+            self._orchestrator = orch
+
+            if self.run_id is None:
+                raise ValueError("No active run")
+
+            asyncio.run(
+                orch.resolve_request(
+                    self.run_id,
+                    request_id,
+                    response_text,
+                    resolution=resolution,
+                )
+            )
 
             self.call_from_thread(self._on_pass_complete)
         except Exception as e:
@@ -279,6 +361,9 @@ class RariApp(App):
             store = StateStore(self.ri_config.db_path)
             run = store.get_run(self.run_id)
             nodes = store.get_run_nodes(self.run_id)
+            blockers = store.get_run_blockers(self.run_id)
+            inbox = store.get_run_inbox(self.run_id)
+            work_items = store.get_run_downstream_tasks(self.run_id)
             store.close()
         except Exception:
             return
@@ -293,10 +378,20 @@ class RariApp(App):
         line = f"[{status_color}]{run.status}[/]  [dim]{len(nodes)} nodes  {completed} done[/]"
         if failed:
             line += f"  [red]{failed} failed[/]"
+        if blockers:
+            line += f"  [yellow]{len(blockers)} blocked[/]"
+        if inbox:
+            line += f"  [blue]{len(inbox)} inbox[/]"
+        if work_items:
+            line += f"  [magenta]{len(work_items)} work[/]"
         output.write(line)
 
         if run.status == "paused":
-            output.write("[dim]type your next instructions, or /tree[/]")
+            output.write("[dim]type your next instructions, or /work to inspect pending requests and tasks[/]")
+            if blockers:
+                self._write_blocker_lines(output, blockers, limit=2)
+            if work_items:
+                self._write_downstream_task_lines(output, work_items, limit=2)
         output.write("")
 
         self._refresh_tree()
@@ -404,6 +499,27 @@ class RariApp(App):
                 if domain.module_scope:
                     detail.write(f"[dim]scope[/]    {domain.module_scope}")
 
+            request = store.get_latest_request(node_id)
+            if request:
+                payload = request["request"]
+                detail.write(f"[dim]request[/]  [blue]{payload.get('kind', 'request')}[/]")
+                title = payload.get("summary") or payload.get("details", "")
+                if title:
+                    detail.write(f"[dim]summary[/]  {title[:100]}")
+                action = payload.get("action_requested")
+                if action:
+                    detail.write(f"[dim]action[/]   {action[:100]}")
+            downstream_task = store.get_latest_downstream_task(node_id)
+            if downstream_task:
+                payload = downstream_task["task"]
+                detail.write(f"[dim]work[/]     [magenta]{payload.get('kind', 'task')}[/]")
+                title = payload.get("summary") or payload.get("task_spec", "")
+                if title:
+                    detail.write(f"[dim]summary[/]  {title[:100]}")
+                task_spec = payload.get("task_spec")
+                if task_spec and task_spec != title:
+                    detail.write(f"[dim]details[/]  {task_spec[:100]}")
+
             events = store.get_node_events(node_id)
             if events:
                 detail.write(f"\n[dim]events ({len(events)})[/]")
@@ -463,6 +579,9 @@ class RariApp(App):
             store = StateStore(self.ri_config.db_path)
             run = store.get_run(self.run_id)
             nodes = store.get_run_nodes(self.run_id)
+            blockers = store.get_run_blockers(self.run_id)
+            inbox = store.get_run_inbox(self.run_id)
+            work_items = store.get_run_downstream_tasks(self.run_id)
             store.close()
 
             if not run:
@@ -484,11 +603,114 @@ class RariApp(App):
                 f"[green]{done} done[/]  [cyan]{active} active[/]"
                 + (f"  [red]{failed} failed[/]" if failed else "")
             )
+            output.write(
+                f"[dim]telemetry[/] {run.telemetry.get('user_interruptions_count', 0)} interrupts  "
+                f"{run.telemetry.get('root_requests_count', 0)} requests  "
+                f"{run.telemetry.get('resolved_requests_count', 0)} resolved"
+            )
+            if inbox:
+                output.write(f"[blue]root inbox[/] {len(inbox)} unresolved")
+                self._write_inbox_lines(output, inbox, limit=2)
+            if work_items:
+                output.write(f"[magenta]downstream work[/] {len(work_items)} unresolved")
+                self._write_downstream_task_lines(output, work_items, limit=2)
+            if blockers:
+                output.write(f"[yellow]active blockers[/] {len(blockers)}")
+                self._write_blocker_lines(output, blockers, limit=2)
             if self._busy:
                 output.write("[cyan]working...[/]")
             output.write("")
         except Exception as e:
             output.write(f"[red]error: {e}[/]")
+
+    def _show_blockers(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            store = StateStore(self.ri_config.db_path)
+            run = store.get_run(self.run_id)
+            blockers = store.get_run_blockers(self.run_id)
+            store.close()
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        if not run:
+            output.write("[dim]run not found[/]")
+            return
+
+        output.write(f"[dim]run[/]      {self.run_id}")
+        output.write(
+            f"[dim]telemetry[/] {run.telemetry.get('user_interruptions_count', 0)} interrupts  "
+            f"{run.telemetry.get('root_requests_count', 0)} requests  "
+            f"{run.telemetry.get('resolved_requests_count', 0)} resolved"
+        )
+        if not blockers:
+            output.write("[dim]no active blockers[/]")
+            output.write("")
+            return
+        output.write(f"[yellow]active blockers[/] {len(blockers)}")
+        self._write_blocker_lines(output, blockers, limit=None)
+        output.write("")
+
+    def _show_inbox(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            store = StateStore(self.ri_config.db_path)
+            run = store.get_run(self.run_id)
+            inbox = store.get_run_inbox(self.run_id)
+            store.close()
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        if not run:
+            output.write("[dim]run not found[/]")
+            return
+
+        output.write(f"[dim]run[/]      {self.run_id}")
+        output.write(
+            f"[dim]telemetry[/] {run.telemetry.get('root_requests_count', 0)} requests  "
+            f"{run.telemetry.get('resolved_requests_count', 0)} resolved"
+        )
+        if not inbox:
+            output.write("[dim]inbox is empty[/]")
+            output.write("")
+            return
+        output.write(f"[blue]root inbox[/] {len(inbox)} unresolved")
+        self._write_inbox_lines(output, inbox, limit=None)
+        output.write("[dim]use /answer, /approve, or /decline with a request id to resolve one[/]")
+        output.write("")
+
+    def _show_work_items(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            store = StateStore(self.ri_config.db_path)
+            work_items = store.get_run_downstream_tasks(self.run_id)
+            store.close()
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        if not work_items:
+            output.write("[dim]no unresolved downstream work items[/]")
+            output.write("")
+            return
+
+        output.write(f"[magenta]downstream work[/] {len(work_items)} unresolved")
+        self._write_downstream_task_lines(output, work_items, limit=None)
+        output.write("")
 
     def action_toggle_tree(self) -> None:
         self._refresh_tree()
@@ -507,6 +729,84 @@ class RariApp(App):
         if tool == "Agent":
             return inp.get("description", "")[:40]
         return ""
+
+    def _write_blocker_lines(self, output: RichLog, blockers: list[dict[str, Any]], limit: int | None) -> None:
+        subset = blockers[:limit] if limit is not None else blockers
+        for blocker_entry in subset:
+            blocker = blocker_entry["blocker"]
+            escalation = blocker.get("escalation", {})
+            title = escalation.get("summary") or blocker.get("details") or blocker.get("kind", "blocked")
+            domain = blocker_entry.get("domain_name")
+            domain_tag = f" [magenta]{domain}[/]" if domain else ""
+            output.write(
+                f"  [yellow]![/] [{self._state_color(blocker_entry['state'])}]{blocker_entry['state']}[/]"
+                f"{domain_tag} [dim]{blocker_entry['node_id'][:12]}[/] {title[:80]}"
+            )
+            action = escalation.get("action_requested")
+            if action:
+                output.write(f"    [dim]action[/] {action[:88]}")
+        if limit is not None and len(blockers) > limit:
+            output.write(f"    [dim]+{len(blockers) - limit} more blocker(s)[/]")
+
+    def _write_inbox_lines(self, output: RichLog, inbox: list[dict[str, Any]], limit: int | None) -> None:
+        subset = inbox[:limit] if limit is not None else inbox
+        for item in subset:
+            request = item["request"]
+            domain = item.get("domain_name")
+            domain_tag = f" [magenta]{domain}[/]" if domain else ""
+            output.write(
+                f"  [blue]>[/] {request.get('kind', 'request')}{domain_tag} "
+                f"[dim]{item['request_id']}[/] {request.get('summary', '')[:80]}"
+            )
+            action = request.get("action_requested")
+            if action:
+                output.write(f"    [dim]action[/] {action[:88]}")
+        if limit is not None and len(inbox) > limit:
+            output.write(f"    [dim]+{len(inbox) - limit} more inbox item(s)[/]")
+
+    def _write_downstream_task_lines(self, output: RichLog, work_items: list[dict[str, Any]], limit: int | None) -> None:
+        subset = work_items[:limit] if limit is not None else work_items
+        for item in subset:
+            task = item["task"]
+            domain = item.get("domain_name")
+            domain_tag = f" [magenta]{domain}[/]" if domain else ""
+            summary = task.get("summary") or task.get("task_spec", "")
+            output.write(
+                f"  [magenta]>[/] {task.get('kind', 'task')}{domain_tag} "
+                f"[dim]{item['node_id'][:12]}[/] {summary[:80]}"
+            )
+            details = task.get("task_spec")
+            if details and details != summary:
+                output.write(f"    [dim]details[/] {details[:88]}")
+        if limit is not None and len(work_items) > limit:
+            output.write(f"    [dim]+{len(work_items) - limit} more work item(s)[/]")
+
+    @staticmethod
+    def _state_color(state: str) -> str:
+        return {"paused": "yellow", "failed": "red", "completed": "green"}.get(state, "cyan")
+
+    @staticmethod
+    def _parse_request_action(command: str) -> tuple[str, str, str] | None:
+        raw = command.strip()
+        name, _, remainder = raw.partition(" ")
+        action = name.lower()
+        if action not in {"/answer", "/approve", "/decline"}:
+            return None
+        request_id, _, response_text = remainder.strip().partition(" ")
+        if not request_id:
+            return action, "", ""
+        return action, request_id, response_text.strip()
+
+    @staticmethod
+    def _resolution_text(resolution: str, text: str) -> str:
+        normalized = text.strip()
+        if normalized:
+            return normalized
+        if resolution == "approve":
+            return "Approved."
+        if resolution == "decline":
+            return "Declined."
+        raise ValueError("A response is required")
 
 
 def run_tui(config: RuntimeConfig, model: str, run_id: str | None = None) -> None:

@@ -109,3 +109,4 @@ rari export-report <benchmark-run-id>
 
 - [architecture.md](architecture.md)
 - [claude_runtime_plan.md](claude_runtime_plan.md)
+- [productization_plan.md](productization_plan.md)

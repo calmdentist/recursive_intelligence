@@ -61,6 +61,11 @@ class TestParsePlanDecision:
         result = parse_plan_decision(text)
         assert result["action"] == "spawn_children"
 
+    def test_route_to_children(self):
+        text = '{"action": "route_to_children", "routes": [{"child_node_id": "node-1", "task_spec": "fix auth"}]}'
+        result = parse_plan_decision(text)
+        assert result["action"] == "route_to_children"
+
     def test_missing_action_raises(self):
         with pytest.raises(ParseError, match="missing 'action'"):
             parse_plan_decision('{"rationale": "no action"}')
