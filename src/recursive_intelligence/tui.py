@@ -24,6 +24,7 @@ from textual.widgets import (
 from textual.widgets.tree import TreeNode
 
 from recursive_intelligence.config import RuntimeConfig
+from recursive_intelligence.runtime.delivery import DeliveryController
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
 from recursive_intelligence.runtime.state_store import StateStore, NodeState
 
@@ -121,7 +122,7 @@ class RariApp(App):
                 yield RichLog(id="detail", wrap=True, highlight=True, markup=True)
         yield Static("", id="status-bar")
         yield Input(
-            placeholder="type a task, or /tree /inbox /work /status /answer <id> ... /help /quit",
+            placeholder="type a task, or /delivery /ready /board /tree /inbox /work /status /answer <id|handle> ... /help /quit",
             id="prompt",
         )
         yield Footer()
@@ -177,8 +178,28 @@ class RariApp(App):
             self._refresh_tree()
             return
 
+        if cmd in ("/board",):
+            self._show_board()
+            return
+
+        if cmd in ("/delivery",):
+            self._show_delivery()
+            return
+
+        if cmd in ("/ready",):
+            self._show_readiness()
+            return
+
         if cmd in ("/domains", "/d"):
             self._show_domains()
+            return
+
+        inspect_node_id = self._parse_inspect_action(raw)
+        if inspect_node_id is not None:
+            if not inspect_node_id:
+                output.write("[dim]usage: /inspect <node_id|handle>[/]")
+                return
+            self._show_node_detail(self._resolve_board_node_target(inspect_node_id))
             return
 
         if cmd in ("/blockers", "/b", "/requests", "/r"):
@@ -203,7 +224,7 @@ class RariApp(App):
                 output.write("[dim]cannot resolve a request while work is still running[/]")
                 return
             if not request_id:
-                output.write(f"[dim]usage: {action} <request_id> <response>[/]")
+                output.write(f"[dim]usage: {action} <request_id|handle> <response>[/]")
                 return
             resolution = {
                 "/answer": "answer",
@@ -211,12 +232,13 @@ class RariApp(App):
                 "/decline": "decline",
             }[action]
             try:
+                resolved_request_id = self._resolve_board_request_target(request_id)
                 normalized = self._resolution_text(resolution, response_text)
             except ValueError as e:
                 output.write(f"[red]error[/] {e}")
                 return
-            output.write(f"[dim]resolving {request_id} ({resolution})...[/]")
-            self._resolve_request(request_id, normalized, resolution)
+            output.write(f"[dim]resolving {resolved_request_id} ({resolution})...[/]")
+            self._resolve_request(resolved_request_id, normalized, resolution)
             return
 
         if cmd in ("/status", "/s"):
@@ -234,13 +256,17 @@ class RariApp(App):
             return
 
         if cmd == "/help":
+            output.write("[bold]/delivery[/] [dim]show previews, deploys, release status, and delivery blockers[/]")
+            output.write("[bold]/ready[/]    [dim]show merge readiness and blockers[/]")
+            output.write("[bold]/board[/]    [dim]show grouped requests, work, and recent results[/]")
             output.write("[bold]/tree[/]     [dim]show/refresh the node tree[/]")
+            output.write("[bold]/inspect[/]  [dim]inspect a node: /inspect <node_id|handle>[/]")
             output.write("[bold]/domains[/]  [dim]show domain registry[/]")
             output.write("[bold]/inbox[/]    [dim]show unresolved root-inbox requests[/]")
             output.write("[bold]/work[/]     [dim]show unresolved downstream work items[/]")
-            output.write("[bold]/answer[/]   [dim]answer a request: /answer <id> <text>[/]")
-            output.write("[bold]/approve[/]  [dim]approve a request: /approve <id> [note][/]")
-            output.write("[bold]/decline[/]  [dim]decline a request: /decline <id> [reason][/]")
+            output.write("[bold]/answer[/]   [dim]answer a request: /answer <id|handle> <text>[/]")
+            output.write("[bold]/approve[/]  [dim]approve a request: /approve <id|handle> [note][/]")
+            output.write("[bold]/decline[/]  [dim]decline a request: /decline <id|handle> [reason][/]")
             output.write("[bold]/requests[/] [dim]show active upstream requests[/]")
             output.write("[bold]/blockers[/] [dim]legacy alias for /requests[/]")
             output.write("[bold]/status[/]   [dim]show run status[/]")
@@ -364,6 +390,7 @@ class RariApp(App):
             blockers = store.get_run_blockers(self.run_id)
             inbox = store.get_run_inbox(self.run_id)
             work_items = store.get_run_downstream_tasks(self.run_id)
+            readiness = store.get_run_readiness(self.run_id)
             store.close()
         except Exception:
             return
@@ -385,9 +412,13 @@ class RariApp(App):
         if work_items:
             line += f"  [magenta]{len(work_items)} work[/]"
         output.write(line)
+        if readiness["ready"]:
+            output.write("[green]ready[/] run is clear to land")
+        elif readiness["blockers"]:
+            output.write("[yellow]ready?[/] no  [dim]use /ready for the landing checklist[/]")
 
         if run.status == "paused":
-            output.write("[dim]type your next instructions, or /work to inspect pending requests and tasks[/]")
+            output.write("[dim]type your next instructions, or /board to inspect pending requests and tasks[/]")
             if blockers:
                 self._write_blocker_lines(output, blockers, limit=2)
             if work_items:
@@ -520,6 +551,11 @@ class RariApp(App):
                 if task_spec and task_spec != title:
                     detail.write(f"[dim]details[/]  {task_spec[:100]}")
 
+            recent_results = store.get_node_recent_results(node_id)
+            if recent_results:
+                detail.write(f"\n[dim]recent results ({len(recent_results)})[/]")
+                self._write_recent_result_lines(detail, recent_results, limit=None, show_actions=False)
+
             events = store.get_node_events(node_id)
             if events:
                 detail.write(f"\n[dim]events ({len(events)})[/]")
@@ -582,6 +618,7 @@ class RariApp(App):
             blockers = store.get_run_blockers(self.run_id)
             inbox = store.get_run_inbox(self.run_id)
             work_items = store.get_run_downstream_tasks(self.run_id)
+            readiness = store.get_run_readiness(self.run_id)
             store.close()
 
             if not run:
@@ -608,6 +645,10 @@ class RariApp(App):
                 f"{run.telemetry.get('root_requests_count', 0)} requests  "
                 f"{run.telemetry.get('resolved_requests_count', 0)} resolved"
             )
+            if readiness["ready"]:
+                output.write("[green]ready[/] clear to land")
+            elif readiness["blockers"]:
+                output.write("[yellow]ready[/] blocked  [dim]use /ready[/]")
             if inbox:
                 output.write(f"[blue]root inbox[/] {len(inbox)} unresolved")
                 self._write_inbox_lines(output, inbox, limit=2)
@@ -686,7 +727,7 @@ class RariApp(App):
             return
         output.write(f"[blue]root inbox[/] {len(inbox)} unresolved")
         self._write_inbox_lines(output, inbox, limit=None)
-        output.write("[dim]use /answer, /approve, or /decline with a request id to resolve one[/]")
+        output.write("[dim]use /answer, /approve, or /decline with a handle or request id to resolve one[/]")
         output.write("")
 
     def _show_work_items(self) -> None:
@@ -710,6 +751,174 @@ class RariApp(App):
 
         output.write(f"[magenta]downstream work[/] {len(work_items)} unresolved")
         self._write_downstream_task_lines(output, work_items, limit=None)
+        output.write("")
+
+    def _show_board(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            store = StateStore(self.ri_config.db_path)
+            board = store.get_run_work_board(self.run_id)
+            store.close()
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        run = board["run"]
+        nodes = board["nodes"]
+        inbox = board["inbox"]
+        work_items = board["downstream_tasks"]
+        recent_results = board["recent_results"]
+
+        output.write(f"[dim]run[/]      {self.run_id}")
+        if run:
+            status_color = {"paused": "yellow", "completed": "green", "failed": "red"}.get(
+                run.status, "cyan"
+            )
+            line = (
+                f"[dim]status[/]   [{status_color}]{run.status}[/]  "
+                f"[dim]pass[/] {run.pass_count}  "
+                f"[dim]nodes[/] {len(nodes)}  "
+                f"[green]{board['completed_count']} done[/]  "
+                f"[cyan]{board['active_count']} active[/]"
+            )
+            if board["failed_count"]:
+                line += f"  [red]{board['failed_count']} failed[/]"
+            output.write(line)
+            output.write(
+                f"[dim]telemetry[/] {run.telemetry.get('user_interruptions_count', 0)} interrupts  "
+                f"{run.telemetry.get('root_requests_count', 0)} requests  "
+                f"{run.telemetry.get('resolved_requests_count', 0)} resolved"
+            )
+
+        if not inbox and not work_items and not recent_results:
+            output.write("[dim]board is empty[/]")
+            output.write("")
+            return
+
+        if inbox:
+            output.write(f"[blue]root inbox[/] {len(inbox)} unresolved")
+            self._write_inbox_lines(output, inbox, limit=5, show_actions=True)
+            output.write("[dim]use /answer, /approve, or /decline with a handle or request id to resolve one[/]")
+        if work_items:
+            output.write(f"[magenta]downstream work[/] {len(work_items)} unresolved")
+            self._write_downstream_task_lines(output, work_items, limit=5, show_actions=True)
+        if recent_results:
+            output.write(f"[green]recent results[/] {len(recent_results)}")
+            self._write_recent_result_lines(output, recent_results, limit=5, show_actions=True)
+        output.write("")
+
+    def _show_readiness(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            store = StateStore(self.ri_config.db_path)
+            readiness = store.get_run_readiness(self.run_id)
+            store.close()
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        run = readiness["run"]
+        output.write(f"[dim]run[/]      {self.run_id}")
+        if run:
+            status_color = {"paused": "yellow", "completed": "green", "failed": "red"}.get(
+                run.status, "cyan"
+            )
+            output.write(
+                f"[dim]status[/]   [{status_color}]{run.status}[/]  "
+                f"[dim]nodes[/] {len(readiness['nodes'])}  "
+                f"[dim]paused[/] {readiness['paused_node_count']}"
+            )
+
+        if readiness["ready"]:
+            output.write("[green]ready[/] run is clear to land")
+            output.write("")
+            return
+
+        output.write("[yellow]not ready[/] unresolved blockers remain")
+        for blocker in readiness["blockers"]:
+            action = blocker.get("action")
+            hint = f" [dim]-> {action}[/]" if action else ""
+            output.write(f"  [yellow]![/] {blocker['message']}{hint}")
+
+        recent_failures = readiness["recent_failures"]
+        if recent_failures:
+            output.write("[dim]recent failures[/]")
+            self._write_recent_result_lines(output, recent_failures, limit=3, show_actions=True)
+        output.write("")
+
+    def _show_delivery(self) -> None:
+        output = self.query_one("#output", RichLog)
+        if not self.run_id:
+            output.write("[dim]no active run[/]")
+            return
+
+        try:
+            controller = DeliveryController(self.ri_config)
+            overview = controller.get_overview(self.run_id)
+        except Exception as e:
+            output.write(f"[red]error: {e}[/]")
+            return
+
+        run = overview["run"]
+        readiness = overview["readiness"]
+        release = overview["release"]
+        blockers = overview["blockers"]
+        previews = overview["previews"]
+        deployments = overview["deployments"]
+        artifacts = overview["artifacts"]
+
+        output.write(f"[dim]run[/]      {run.run_id}")
+        output.write(
+            f"[dim]release[/]  {release.get('status', 'draft')}"
+            + (f"  [dim]{release.get('note', '')[:72]}[/]" if release.get("note") else "")
+        )
+        output.write(
+            "[dim]ready[/]    "
+            + ("[green]clear to land[/]" if readiness["ready"] else "[yellow]blocked[/]")
+        )
+        output.write(f"[dim]artifacts[/] {artifacts['run_dir']}")
+        output.write(f"[dim]report[/]    {artifacts['report_path']}")
+        output.write(f"[dim]delivery[/]  {artifacts['delivery_path']}")
+
+        if blockers:
+            output.write(f"[yellow]delivery blockers[/] {len(blockers)} unresolved")
+            for blocker in blockers[:5]:
+                output.write(
+                    f"  [yellow]![/] [blue]{blocker.get('kind', 'blocker')}[/] "
+                    f"{blocker.get('summary', '')[:80]}"
+                )
+                if blocker.get("action_requested"):
+                    output.write(f"    [dim]action[/] {blocker['action_requested'][:88]}")
+                output.write(f"    [dim]id[/] {blocker.get('blocker_id', '')}")
+
+        if previews:
+            output.write(f"[cyan]previews[/] {len(previews)}")
+            for preview in previews[:5]:
+                output.write(
+                    f"  [cyan]>[/] [dim]{preview.get('label', 'preview')}[/] "
+                    f"{preview.get('status', 'ready')} {preview.get('url', '')[:80]}"
+                )
+                if preview.get("note"):
+                    output.write(f"    [dim]note[/] {preview['note'][:88]}")
+
+        if deployments:
+            output.write(f"[magenta]deployments[/] {len(deployments)}")
+            for deployment in deployments[:5]:
+                output.write(
+                    f"  [magenta]>[/] [dim]{deployment.get('environment', 'env')}[/] "
+                    f"{deployment.get('status', 'deployed')} {deployment.get('url', '')[:80]}"
+                )
+                output.write(f"    [dim]verify[/] {deployment.get('verification_status', 'unknown')[:88]}")
+                if deployment.get("note"):
+                    output.write(f"    [dim]note[/] {deployment['note'][:88]}")
         output.write("")
 
     def action_toggle_tree(self) -> None:
@@ -748,23 +957,26 @@ class RariApp(App):
         if limit is not None and len(blockers) > limit:
             output.write(f"    [dim]+{len(blockers) - limit} more blocker(s)[/]")
 
-    def _write_inbox_lines(self, output: RichLog, inbox: list[dict[str, Any]], limit: int | None) -> None:
+    def _write_inbox_lines(self, output: RichLog, inbox: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
         subset = inbox[:limit] if limit is not None else inbox
         for item in subset:
             request = item["request"]
             domain = item.get("domain_name")
             domain_tag = f" [magenta]{domain}[/]" if domain else ""
             output.write(
-                f"  [blue]>[/] {request.get('kind', 'request')}{domain_tag} "
+                f"  [blue]>[/] [dim]{item.get('board_handle', '')}[/] {request.get('kind', 'request')}{domain_tag} "
                 f"[dim]{item['request_id']}[/] {request.get('summary', '')[:80]}"
             )
             action = request.get("action_requested")
             if action:
                 output.write(f"    [dim]action[/] {action[:88]}")
+            if show_actions:
+                output.write(f"    [dim]reply[/] /answer {item.get('board_handle', item['request_id'])} ...")
+                output.write(f"    [dim]open[/] /inspect {item.get('board_handle', item['request_id'])}")
         if limit is not None and len(inbox) > limit:
             output.write(f"    [dim]+{len(inbox) - limit} more inbox item(s)[/]")
 
-    def _write_downstream_task_lines(self, output: RichLog, work_items: list[dict[str, Any]], limit: int | None) -> None:
+    def _write_downstream_task_lines(self, output: RichLog, work_items: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
         subset = work_items[:limit] if limit is not None else work_items
         for item in subset:
             task = item["task"]
@@ -772,14 +984,33 @@ class RariApp(App):
             domain_tag = f" [magenta]{domain}[/]" if domain else ""
             summary = task.get("summary") or task.get("task_spec", "")
             output.write(
-                f"  [magenta]>[/] {task.get('kind', 'task')}{domain_tag} "
-                f"[dim]{item['node_id'][:12]}[/] {summary[:80]}"
+                f"  [magenta]>[/] [dim]{item.get('board_handle', '')}[/] {task.get('kind', 'task')}{domain_tag} "
+                f"[dim]{item['node_id']}[/] {summary[:80]}"
             )
             details = task.get("task_spec")
             if details and details != summary:
                 output.write(f"    [dim]details[/] {details[:88]}")
+            if show_actions:
+                output.write(f"    [dim]open[/] /inspect {item.get('board_handle', item['node_id'])}")
         if limit is not None and len(work_items) > limit:
             output.write(f"    [dim]+{len(work_items) - limit} more work item(s)[/]")
+
+    def _write_recent_result_lines(self, output: RichLog, results: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
+        subset = results[:limit] if limit is not None else results
+        for item in subset:
+            domain = item.get("domain_name")
+            domain_tag = f" [magenta]{domain}[/]" if domain else ""
+            summary = item.get("summary") or item.get("status", "")
+            status = item.get("status", "")
+            status_tag = f" [dim][{status}][/]" if status else ""
+            output.write(
+                f"  [green]>[/] [dim]{item.get('board_handle', '')}[/] {item.get('kind', 'result')}{domain_tag} "
+                f"[dim]{item['node_id']}[/] {summary[:80]}{status_tag}"
+            )
+            if show_actions:
+                output.write(f"    [dim]open[/] /inspect {item.get('board_handle', item['node_id'])}")
+        if limit is not None and len(results) > limit:
+            output.write(f"    [dim]+{len(results) - limit} more result(s)[/]")
 
     @staticmethod
     def _state_color(state: str) -> str:
@@ -796,6 +1027,42 @@ class RariApp(App):
         if not request_id:
             return action, "", ""
         return action, request_id, response_text.strip()
+
+    @staticmethod
+    def _parse_inspect_action(command: str) -> str | None:
+        raw = command.strip()
+        name, _, remainder = raw.partition(" ")
+        if name.lower() not in {"/inspect", "/open"}:
+            return None
+        node_id = remainder.strip()
+        return node_id or ""
+
+    def _resolve_board_node_target(self, target: str) -> str:
+        if not self.run_id:
+            return target
+        try:
+            store = StateStore(self.ri_config.db_path)
+            item = store.get_run_board_item(self.run_id, target)
+            store.close()
+        except Exception:
+            return target
+        if item is None:
+            return target
+        return item.get("source_child_id") or item.get("node_id", target)
+
+    def _resolve_board_request_target(self, target: str) -> str:
+        if not self.run_id:
+            return target
+        try:
+            store = StateStore(self.ri_config.db_path)
+            item = store.get_run_board_item(self.run_id, target)
+            store.close()
+        except Exception:
+            return target
+        if item is None:
+            return target
+        request = item.get("request", {})
+        return request.get("request_id", target)
 
     @staticmethod
     def _resolution_text(resolution: str, text: str) -> str:

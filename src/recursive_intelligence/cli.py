@@ -16,6 +16,7 @@ from typing import Any
 import click
 
 from recursive_intelligence.config import RuntimeConfig
+from recursive_intelligence.runtime.delivery import DeliveryController
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
 from recursive_intelligence.runtime.state_store import StateStore, NodeState
 
@@ -655,7 +656,7 @@ def continue_run(ctx: click.Context, run_id: str, task: str, model: str) -> None
 @click.option("--model", default="claude-sonnet-4-6", help="Model to use")
 @click.pass_context
 def answer(ctx: click.Context, run_id: str, request_id: str, response: tuple[str, ...], model: str) -> None:
-    """Answer a specific root-inbox request and continue the run."""
+    """Answer a specific root-inbox request or board handle and continue the run."""
     _resolve_request_command(
         ctx,
         run_id,
@@ -673,7 +674,7 @@ def answer(ctx: click.Context, run_id: str, request_id: str, response: tuple[str
 @click.option("--model", default="claude-sonnet-4-6", help="Model to use")
 @click.pass_context
 def approve(ctx: click.Context, run_id: str, request_id: str, note: tuple[str, ...], model: str) -> None:
-    """Approve a specific root-inbox request and continue the run."""
+    """Approve a specific root-inbox request or board handle and continue the run."""
     _resolve_request_command(
         ctx,
         run_id,
@@ -691,7 +692,7 @@ def approve(ctx: click.Context, run_id: str, request_id: str, note: tuple[str, .
 @click.option("--model", default="claude-sonnet-4-6", help="Model to use")
 @click.pass_context
 def decline(ctx: click.Context, run_id: str, request_id: str, reason: tuple[str, ...], model: str) -> None:
-    """Decline a specific root-inbox request and continue the run."""
+    """Decline a specific root-inbox request or board handle and continue the run."""
     _resolve_request_command(
         ctx,
         run_id,
@@ -719,7 +720,7 @@ def chat(ctx: click.Context, run_id: str | None, model: str) -> None:
 
     click.echo(f"{INDENT}{_dim('model')}  {model}")
     click.echo(f"{INDENT}{_dim('repo')}   {config.repo_root}")
-    click.echo(f"{INDENT}{_dim('tips')}   /tree /domains /requests /inbox /work /status /help /quit")
+    click.echo(f"{INDENT}{_dim('tips')}   /delivery /ready /board /tree /domains /requests /inbox /work /status /help /quit")
     click.echo()
 
     if run_id:
@@ -826,56 +827,8 @@ def inspect(ctx: click.Context, node_id: str) -> None:
     config.ensure_dirs()
     store = StateStore(config.db_path)
 
-    node = store.get_node(node_id)
-    if node is None:
-        click.echo(f"{INDENT}{_red('error')} Node {node_id} not found")
-        store.close()
-        return
-
     click.echo()
-    click.echo(f"{INDENT}{_bold(node.node_id)}")
-    click.echo(f"{INDENT}{_dim('state')}    {_s(node.state.value)}")
-    click.echo(f"{INDENT}{_dim('task')}     {node.task_spec}")
-    if node.worktree_path:
-        click.echo(f"{INDENT}{_dim('worktree')} {node.worktree_path}")
-
-    domain = store.get_domain_by_child(node_id)
-    if domain:
-        click.echo(f"{INDENT}{_dim('domain')}   {_magenta(domain.domain_name)}")
-    request = store.get_latest_request(node_id)
-    if request:
-        payload = request["request"]
-        click.echo(f"{INDENT}{_dim('request')}  {_blue(payload.get('kind', 'request'))}")
-        summary = payload.get("summary") or payload.get("details", "")
-        if summary:
-            click.echo(f"{INDENT}{_dim('summary')}  {_truncate(summary, 88)}")
-        if payload.get("action_requested"):
-            click.echo(f"{INDENT}{_dim('action')}   {_truncate(payload['action_requested'], 88)}")
-    downstream_task = store.get_latest_downstream_task(node_id)
-    if downstream_task:
-        task = downstream_task["task"]
-        click.echo(f"{INDENT}{_dim('work')}     {_magenta(task.get('kind', 'task'))}")
-        summary = task.get("summary") or task.get("task_spec", "")
-        if summary:
-            click.echo(f"{INDENT}{_dim('summary')}  {_truncate(summary, 88)}")
-        if task.get("task_spec"):
-            click.echo(f"{INDENT}{_dim('details')}  {_truncate(task['task_spec'], 88)}")
-
-    events = store.get_node_events(node_id)
-    if events:
-        click.echo(f"\n{INDENT}{_dim('events')} ({len(events)})")
-        for evt in events:
-            ts = evt.timestamp.split("T")[1][:8] if "T" in evt.timestamp else evt.timestamp
-            click.echo(f"{INDENT}  {_dim(ts)} {evt.event_type}")
-
-    children = store.get_children(node_id)
-    if children:
-        click.echo(f"\n{INDENT}{_dim('children')} ({len(children)})")
-        for child in children:
-            d = store.get_domain_by_child(child.node_id)
-            dtag = f" {_magenta(d.domain_name)}" if d else ""
-            click.echo(f"{INDENT}  {_s(child.state.value):>20s}{dtag}  {child.task_spec[:50]}")
-
+    _print_node_inspect(store, node_id)
     click.echo()
     store.close()
 
@@ -988,6 +941,200 @@ def work_items(ctx: click.Context, run_id: str) -> None:
     store.close()
 
 
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def board(ctx: click.Context, run_id: str) -> None:
+    """Show the grouped root work board for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    config.ensure_dirs()
+    store = StateStore(config.db_path)
+
+    run_record = store.get_run(run_id)
+    if run_record is None:
+        click.echo(f"{INDENT}{_red('error')} Run {run_id} not found")
+        store.close()
+        return
+
+    click.echo()
+    _print_board(store, run_id)
+    click.echo()
+    store.close()
+
+
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def ready(ctx: click.Context, run_id: str) -> None:
+    """Show whether a run is ready to land and what is blocking it."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    config.ensure_dirs()
+    store = StateStore(config.db_path)
+
+    run_record = store.get_run(run_id)
+    if run_record is None:
+        click.echo(f"{INDENT}{_red('error')} Run {run_id} not found")
+        store.close()
+        return
+
+    click.echo()
+    _print_readiness(store, run_id)
+    click.echo()
+    store.close()
+
+
+@main.command()
+@click.argument("run_id")
+@click.pass_context
+def delivery(ctx: click.Context, run_id: str) -> None:
+    """Show the persisted delivery control plane for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        overview = controller.get_overview(run_id)
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        return
+
+    click.echo()
+    _print_delivery_overview(overview)
+    click.echo()
+
+
+@main.command()
+@click.argument("run_id")
+@click.argument("url")
+@click.option("--label", default="preview", help="Preview label")
+@click.option("--status", default="ready", help="Preview status")
+@click.option("--note", default="", help="Optional note")
+@click.pass_context
+def preview(ctx: click.Context, run_id: str, url: str, label: str, status: str, note: str) -> None:
+    """Record a preview URL for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        controller.record_preview(run_id, url, label=label, status=status, note=note)
+        _print_delivery_overview(controller.get_overview(run_id))
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("run_id")
+@click.argument("environment")
+@click.argument("url")
+@click.option("--status", default="deployed", help="Deployment status")
+@click.option("--verify-status", default="unknown", help="Post-deploy verification status")
+@click.option("--note", default="", help="Optional note")
+@click.pass_context
+def deploy(
+    ctx: click.Context,
+    run_id: str,
+    environment: str,
+    url: str,
+    status: str,
+    verify_status: str,
+    note: str,
+) -> None:
+    """Record a deployment URL for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        controller.record_deployment(
+            run_id,
+            environment,
+            url,
+            status=status,
+            verification_status=verify_status,
+            note=note,
+        )
+        _print_delivery_overview(controller.get_overview(run_id))
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("run_id")
+@click.argument("status")
+@click.argument("note", nargs=-1)
+@click.pass_context
+def release(ctx: click.Context, run_id: str, status: str, note: tuple[str, ...]) -> None:
+    """Update release status for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        controller.set_release_status(run_id, status, note=" ".join(note).strip())
+        _print_delivery_overview(controller.get_overview(run_id))
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        sys.exit(1)
+
+
+@main.command(name="delivery-block")
+@click.argument("run_id")
+@click.argument("kind")
+@click.argument("summary")
+@click.option("--details", default="", help="Additional blocker details")
+@click.option("--action", "action_requested", default="", help="Requested operator action")
+@click.pass_context
+def delivery_block(
+    ctx: click.Context,
+    run_id: str,
+    kind: str,
+    summary: str,
+    details: str,
+    action_requested: str,
+) -> None:
+    """Add a delivery blocker to a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        controller.add_blocker(
+            run_id,
+            kind=kind,
+            summary=summary,
+            details=details,
+            action_requested=action_requested,
+        )
+        _print_delivery_overview(controller.get_overview(run_id))
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        sys.exit(1)
+
+
+@main.command(name="delivery-unblock")
+@click.argument("run_id")
+@click.argument("blocker_id")
+@click.argument("note", nargs=-1)
+@click.pass_context
+def delivery_unblock(ctx: click.Context, run_id: str, blocker_id: str, note: tuple[str, ...]) -> None:
+    """Resolve a delivery blocker for a run."""
+    config: RuntimeConfig = ctx.obj["config"]
+    _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    controller = DeliveryController(config)
+
+    try:
+        controller.resolve_blocker(run_id, blocker_id, note=" ".join(note).strip())
+        _print_delivery_overview(controller.get_overview(run_id))
+    except Exception as e:
+        click.echo(f"{INDENT}{_red('error')} {e}")
+        sys.exit(1)
+
+
 # ── Adapter factory ──────────────────────────────────────────────────────────
 
 def _make_adapter(model: str = "claude-sonnet-4-6"):
@@ -1015,6 +1162,11 @@ def _resolve_request_command(
 ) -> None:
     config: RuntimeConfig = ctx.obj["config"]
     _setup_logging(ctx.obj["verbose"], chat_mode=False, config=config)
+    config.ensure_dirs()
+
+    store = StateStore(config.db_path)
+    resolved_request_id = _resolve_board_request_target(store, run_id, request_id) or request_id
+    store.close()
 
     adapter = _make_adapter(model)
     orchestrator = Orchestrator(config, adapter)
@@ -1024,7 +1176,7 @@ def _resolve_request_command(
         asyncio.run(
             orchestrator.resolve_request(
                 run_id,
-                request_id,
+                resolved_request_id,
                 normalized,
                 resolution=resolution,
             )
@@ -1055,6 +1207,7 @@ def _print_pass_summary(config: RuntimeConfig, run_id: str) -> None:
     blockers = store.get_run_blockers(run_id)
     inbox = store.get_run_inbox(run_id)
     work_items = store.get_run_downstream_tasks(run_id)
+    readiness = store.get_run_readiness(run_id)
     store.close()
 
     click.echo()
@@ -1069,10 +1222,14 @@ def _print_pass_summary(config: RuntimeConfig, run_id: str) -> None:
     if work_items:
         click.echo(f"{INDENT}{_magenta('work')} {_dim(f'{len(work_items)} downstream task(s)')}")
         _print_downstream_task_lines(work_items, limit=2)
+    if readiness["ready"]:
+        click.echo(f"{INDENT}{_green('ready')} {_dim('run is clear to land')}")
+    elif readiness["blockers"]:
+        click.echo(f"{INDENT}{_yellow('ready?')} {_dim('no - use /ready for the landing checklist')}")
     click.echo()
 
     if status == "paused":
-        click.echo(f"{INDENT}{_dim('type your next instructions, or /work to inspect pending requests and tasks')}")
+        click.echo(f"{INDENT}{_dim('type your next instructions, or /board to inspect pending requests and tasks')}")
         click.echo()
 
 
@@ -1088,6 +1245,7 @@ def _print_run_result(config: RuntimeConfig, run_id: str) -> None:
     blockers = store.get_run_blockers(run_id) if run_record else []
     inbox = store.get_run_inbox(run_id) if run_record else []
     work_items = store.get_run_downstream_tasks(run_id) if run_record else []
+    readiness = store.get_run_readiness(run_id) if run_record else None
     store.close()
 
     click.echo(_hr())
@@ -1101,6 +1259,10 @@ def _print_run_result(config: RuntimeConfig, run_id: str) -> None:
             f"{run_record.telemetry.get('root_requests_count', 0)} requests  "
             f"{run_record.telemetry.get('resolved_requests_count', 0)} resolved"
         )
+        if readiness and readiness["ready"]:
+            click.echo(f"{INDENT}{_green('ready')} clear to land")
+        elif readiness and readiness["blockers"]:
+            click.echo(f"{INDENT}{_yellow('ready')} blocked  {_dim('use `rari ready <run_id>` or /ready')}")
     if inbox:
         click.echo(f"{INDENT}{_blue('inbox')} {len(inbox)} unresolved")
         _print_inbox_lines(inbox, limit=3)
@@ -1189,6 +1351,32 @@ def _parse_request_action(command: str) -> tuple[str, str, str] | None:
     return action, request_id, response_text.strip()
 
 
+def _parse_inspect_action(command: str) -> str | None:
+    raw = command.strip()
+    name, _, remainder = raw.partition(" ")
+    if name.lower() not in {"/inspect", "/open"}:
+        return None
+    node_id = remainder.strip()
+    return node_id or ""
+
+
+def _resolve_board_node_target(store: StateStore, run_id: str, target: str) -> str | None:
+    item = store.get_run_board_item(run_id, target)
+    if item is None:
+        return target
+    return item.get("source_child_id") or item.get("node_id") or target
+
+
+def _resolve_board_request_target(store: StateStore, run_id: str, target: str) -> str | None:
+    item = store.get_run_board_item(run_id, target)
+    if item is None:
+        return target
+    request = item.get("request")
+    if request:
+        return request.get("request_id") or target
+    return target
+
+
 def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRunner) -> bool:
     raw = cmd.strip()
     name, _, _ = raw.partition(" ")
@@ -1218,6 +1406,49 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
             click.echo(_dim(f"{INDENT}no active run."))
         return False
 
+    if cmd in ("/board",):
+        click.echo()
+        if run_id:
+            try:
+                config.ensure_dirs()
+                store = StateStore(config.db_path)
+                _print_board(store, run_id)
+                store.close()
+            except Exception:
+                click.echo(_dim(f"{INDENT}(could not read work board)"))
+        else:
+            click.echo(_dim(f"{INDENT}no active run."))
+        click.echo()
+        return False
+
+    if cmd in ("/delivery",):
+        click.echo()
+        if run_id:
+            try:
+                controller = DeliveryController(config)
+                _print_delivery_overview(controller.get_overview(run_id))
+            except Exception:
+                click.echo(_dim(f"{INDENT}(could not read delivery state)"))
+        else:
+            click.echo(_dim(f"{INDENT}no active run."))
+        click.echo()
+        return False
+
+    if cmd in ("/ready",):
+        click.echo()
+        if run_id:
+            try:
+                config.ensure_dirs()
+                store = StateStore(config.db_path)
+                _print_readiness(store, run_id)
+                store.close()
+            except Exception:
+                click.echo(_dim(f"{INDENT}(could not read readiness state)"))
+        else:
+            click.echo(_dim(f"{INDENT}no active run."))
+        click.echo()
+        return False
+
     if cmd in ("/domains", "/d"):
         click.echo()
         if run_id:
@@ -1238,6 +1469,28 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
         click.echo()
         return False
 
+    inspect_node_id = _parse_inspect_action(raw)
+    if inspect_node_id is not None:
+        click.echo()
+        if not run_id:
+            click.echo(_dim(f"{INDENT}no active run."))
+            click.echo()
+            return False
+        if not inspect_node_id:
+            click.echo(_dim(f"{INDENT}usage: /inspect <node_id|handle>"))
+            click.echo()
+            return False
+        try:
+            config.ensure_dirs()
+            store = StateStore(config.db_path)
+            resolved_node_id = _resolve_board_node_target(store, run_id, inspect_node_id)
+            _print_node_inspect(store, resolved_node_id or inspect_node_id)
+            store.close()
+        except Exception:
+            click.echo(_dim(f"{INDENT}(could not inspect node)"))
+        click.echo()
+        return False
+
     request_action = _parse_request_action(raw)
     if request_action is not None:
         action, request_id, response_text = request_action
@@ -1248,7 +1501,7 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
             click.echo(f"\n{INDENT}{_dim('cannot resolve a request while work is still running')}\n")
             return False
         if not request_id:
-            click.echo(f"\n{INDENT}{_dim(f'usage: {action} <request_id> <response>')}\n")
+            click.echo(f"\n{INDENT}{_dim(f'usage: {action} <request_id|handle> <response>')}\n")
             return False
         resolution = {
             "/answer": "answer",
@@ -1256,12 +1509,16 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
             "/decline": "decline",
         }[action]
         try:
+            config.ensure_dirs()
+            store = StateStore(config.db_path)
+            resolved_request_id = _resolve_board_request_target(store, run_id, request_id)
+            store.close()
             normalized = _resolution_text(resolution, response_text)
         except click.ClickException as e:
             click.echo(f"\n{INDENT}{_red('error')} {e.format_message()}\n")
             return False
         click.echo()
-        runner.resolve_request(request_id, normalized, resolution=resolution)
+        runner.resolve_request(resolved_request_id or request_id, normalized, resolution=resolution)
         return False
 
     if cmd in ("/blockers", "/b", "/requests", "/r"):
@@ -1319,6 +1576,7 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
                 blockers = store.get_run_blockers(run_id)
                 inbox = store.get_run_inbox(run_id)
                 work_items = store.get_run_downstream_tasks(run_id)
+                readiness = store.get_run_readiness(run_id)
                 store.close()
                 active = [n for n in nodes if not n.state.is_idle]
                 click.echo(f"{INDENT}{_dim('run')}    {run_id}")
@@ -1329,6 +1587,10 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
                     f"{rr.telemetry.get('root_requests_count', 0)} requests  "
                     f"{rr.telemetry.get('resolved_requests_count', 0)} resolved"
                 )
+                if readiness["ready"]:
+                    click.echo(f"{INDENT}{_green('ready')} clear to land")
+                elif readiness["blockers"]:
+                    click.echo(f"{INDENT}{_yellow('ready')} blocked  {_dim('use /ready')}")
                 if inbox:
                     click.echo(f"{INDENT}{_blue('inbox')} {len(inbox)} unresolved")
                     _print_inbox_lines(inbox, limit=2)
@@ -1354,14 +1616,18 @@ def _handle_slash_command(cmd: str, config: RuntimeConfig, runner: BackgroundRun
 
     if cmd == "/help":
         click.echo()
+        click.echo(f"{INDENT}{_bold('/delivery')} {_dim('show previews, deploys, release status, and delivery blockers')}")
+        click.echo(f"{INDENT}{_bold('/ready')}    {_dim('show merge readiness and blockers')}")
+        click.echo(f"{INDENT}{_bold('/board')}    {_dim('show grouped requests, work, and recent results')}")
         click.echo(f"{INDENT}{_bold('/tree')}     {_dim('show the node tree (live)')}")
+        click.echo(f"{INDENT}{_bold('/inspect')}  {_dim('inspect a node: /inspect <node_id|handle>')}")
         click.echo(f"{INDENT}{_bold('/status')}   {_dim('show run status')}")
         click.echo(f"{INDENT}{_bold('/domains')}  {_dim('show domain registry')}")
         click.echo(f"{INDENT}{_bold('/inbox')}    {_dim('show unresolved root-inbox requests')}")
         click.echo(f"{INDENT}{_bold('/work')}     {_dim('show unresolved downstream work items')}")
-        click.echo(f"{INDENT}{_bold('/answer')}   {_dim('answer a request: /answer <id> <text>')}")
-        click.echo(f"{INDENT}{_bold('/approve')}  {_dim('approve a request: /approve <id> [note]')}")
-        click.echo(f"{INDENT}{_bold('/decline')}  {_dim('decline a request: /decline <id> [reason]')}")
+        click.echo(f"{INDENT}{_bold('/answer')}   {_dim('answer a request: /answer <id|handle> <text>')}")
+        click.echo(f"{INDENT}{_bold('/approve')}  {_dim('approve a request: /approve <id|handle> [note]')}")
+        click.echo(f"{INDENT}{_bold('/decline')}  {_dim('decline a request: /decline <id|handle> [reason]')}")
         click.echo(f"{INDENT}{_bold('/requests')} {_dim('show active upstream requests')}")
         click.echo(f"{INDENT}{_bold('/blockers')} {_dim('legacy alias for /requests')}")
         click.echo(f"{INDENT}{_bold('/log')}      {_dim('show log file path')}")
@@ -1392,6 +1658,61 @@ def _print_blockers(store: StateStore, run_id: str) -> None:
     _print_blocker_lines(blockers, limit=None)
 
 
+def _print_node_inspect(store: StateStore, node_id: str) -> None:
+    node = store.get_node(node_id)
+    if node is None:
+        click.echo(f"{INDENT}{_red('error')} Node {node_id} not found")
+        return
+
+    click.echo(f"{INDENT}{_bold(node.node_id)}")
+    click.echo(f"{INDENT}{_dim('state')}    {_s(node.state.value)}")
+    click.echo(f"{INDENT}{_dim('task')}     {node.task_spec}")
+    if node.worktree_path:
+        click.echo(f"{INDENT}{_dim('worktree')} {node.worktree_path}")
+
+    domain = store.get_domain_by_child(node_id)
+    if domain:
+        click.echo(f"{INDENT}{_dim('domain')}   {_magenta(domain.domain_name)}")
+    request = store.get_latest_request(node_id)
+    if request:
+        payload = request["request"]
+        click.echo(f"{INDENT}{_dim('request')}  {_blue(payload.get('kind', 'request'))}")
+        summary = payload.get("summary") or payload.get("details", "")
+        if summary:
+            click.echo(f"{INDENT}{_dim('summary')}  {_truncate(summary, 88)}")
+        if payload.get("action_requested"):
+            click.echo(f"{INDENT}{_dim('action')}   {_truncate(payload['action_requested'], 88)}")
+    downstream_task = store.get_latest_downstream_task(node_id)
+    if downstream_task:
+        task = downstream_task["task"]
+        click.echo(f"{INDENT}{_dim('work')}     {_magenta(task.get('kind', 'task'))}")
+        summary = task.get("summary") or task.get("task_spec", "")
+        if summary:
+            click.echo(f"{INDENT}{_dim('summary')}  {_truncate(summary, 88)}")
+        if task.get("task_spec"):
+            click.echo(f"{INDENT}{_dim('details')}  {_truncate(task['task_spec'], 88)}")
+
+    recent_results = store.get_node_recent_results(node_id)
+    if recent_results:
+        click.echo(f"\n{INDENT}{_dim('recent results')} ({len(recent_results)})")
+        _print_recent_result_lines(recent_results, limit=None)
+
+    events = store.get_node_events(node_id)
+    if events:
+        click.echo(f"\n{INDENT}{_dim('events')} ({len(events)})")
+        for evt in events:
+            ts = evt.timestamp.split('T')[1][:8] if 'T' in evt.timestamp else evt.timestamp
+            click.echo(f"{INDENT}  {_dim(ts)} {evt.event_type}")
+
+    children = store.get_children(node_id)
+    if children:
+        click.echo(f"\n{INDENT}{_dim('children')} ({len(children)})")
+        for child in children:
+            d = store.get_domain_by_child(child.node_id)
+            dtag = f" {_magenta(d.domain_name)}" if d else ""
+            click.echo(f"{INDENT}  {_s(child.state.value):>20s}{dtag}  {child.task_spec[:50]}")
+
+
 def _print_inbox(store: StateStore, run_id: str) -> None:
     run_record = store.get_run(run_id)
     inbox = store.get_run_inbox(run_id)
@@ -1407,7 +1728,136 @@ def _print_inbox(store: StateStore, run_id: str) -> None:
         return
     click.echo(f"{INDENT}{_blue('root inbox')} {len(inbox)} unresolved")
     _print_inbox_lines(inbox, limit=None)
-    click.echo(f"{INDENT}{_dim('use /answer, /approve, or /decline with a request id to resolve one')}")
+    click.echo(f"{INDENT}{_dim('use /answer, /approve, or /decline with a handle or request id to resolve one')}")
+
+
+def _print_board(store: StateStore, run_id: str) -> None:
+    board = store.get_run_work_board(run_id)
+    run_record = board["run"]
+    nodes = board["nodes"]
+    inbox = board["inbox"]
+    work_items = board["downstream_tasks"]
+    recent_results = board["recent_results"]
+
+    click.echo(f"{INDENT}{_dim('run')}      {run_id}")
+    if run_record:
+        click.echo(
+            f"{INDENT}{_dim('status')}   {_s(run_record.status)}  "
+            f"{_dim('pass')} {run_record.pass_count}  "
+            f"{_dim('nodes')} {len(nodes)}  "
+            f"{_green(f'{board['completed_count']} done')}  "
+            f"{_cyan(f'{board['active_count']} active')}"
+            + (f"  {_red(f'{board['failed_count']} failed')}" if board["failed_count"] else "")
+        )
+        click.echo(
+            f"{INDENT}{_dim('telemetry')} "
+            f"{run_record.telemetry.get('user_interruptions_count', 0)} interrupts  "
+            f"{run_record.telemetry.get('root_requests_count', 0)} requests  "
+            f"{run_record.telemetry.get('resolved_requests_count', 0)} resolved"
+        )
+
+    if not inbox and not work_items and not recent_results:
+        click.echo(_dim(f"{INDENT}Board is empty."))
+        return
+
+    if inbox:
+        click.echo(f"{INDENT}{_blue('root inbox')} {len(inbox)} unresolved")
+        _print_inbox_lines(inbox, limit=5, show_actions=True)
+        click.echo(f"{INDENT}{_dim('use /answer, /approve, or /decline with a handle or request id to resolve one')}")
+
+    if work_items:
+        click.echo(f"{INDENT}{_magenta('downstream work')} {len(work_items)} unresolved")
+        _print_downstream_task_lines(work_items, limit=5, show_actions=True)
+
+    if recent_results:
+        click.echo(f"{INDENT}{_green('recent results')} {len(recent_results)}")
+        _print_recent_result_lines(recent_results, limit=5, show_actions=True)
+
+
+def _print_readiness(store: StateStore, run_id: str) -> None:
+    readiness = store.get_run_readiness(run_id)
+    run_record = readiness["run"]
+
+    click.echo(f"{INDENT}{_dim('run')}      {run_id}")
+    if run_record:
+        click.echo(
+            f"{INDENT}{_dim('status')}   {_s(run_record.status)}  "
+            f"{_dim('nodes')} {len(readiness['nodes'])}  "
+            f"{_dim('paused')} {readiness['paused_node_count']}"
+        )
+
+    if readiness["ready"]:
+        click.echo(f"{INDENT}{_green('ready')} run is clear to land")
+        return
+
+    click.echo(f"{INDENT}{_yellow('not ready')} unresolved blockers remain")
+    for blocker in readiness["blockers"]:
+        action = blocker.get("action")
+        hint = f" {_dim(f'-> {action}')}" if action else ""
+        click.echo(
+            f"{INDENT}  {_yellow('!')} {_truncate(blocker['message'], 84)}{hint}"
+        )
+
+    recent_failures = readiness["recent_failures"]
+    if recent_failures:
+        click.echo(f"{INDENT}{_dim('recent failures')}")
+        _print_recent_result_lines(recent_failures, limit=3, show_actions=True)
+
+
+def _print_delivery_overview(overview: dict[str, Any]) -> None:
+    run_record = overview["run"]
+    readiness = overview["readiness"]
+    release = overview["release"]
+    previews = overview["previews"]
+    deployments = overview["deployments"]
+    blockers = overview["blockers"]
+    artifacts = overview["artifacts"]
+
+    click.echo(f"{INDENT}{_dim('run')}      {run_record.run_id}")
+    click.echo(
+        f"{INDENT}{_dim('release')}  {_s(release.get('status', 'draft'))}"
+        + (f"  {_dim(_truncate(release.get('note', ''), 72))}" if release.get("note") else "")
+    )
+    click.echo(
+        f"{INDENT}{_dim('ready')}    "
+        + (_green("clear to land") if readiness["ready"] else _yellow("blocked"))
+    )
+    click.echo(f"{INDENT}{_dim('artifacts')} {_truncate(artifacts['run_dir'], 88)}")
+    click.echo(f"{INDENT}{_dim('report')}    {_truncate(artifacts['report_path'], 88)}")
+    click.echo(f"{INDENT}{_dim('delivery')}  {_truncate(artifacts['delivery_path'], 88)}")
+
+    if blockers:
+        click.echo(f"{INDENT}{_yellow('delivery blockers')} {len(blockers)} unresolved")
+        for blocker in blockers[:5]:
+            click.echo(
+                f"{INDENT}  {_yellow('!')} {_blue(blocker.get('kind', 'blocker'))} "
+                f"{_truncate(blocker.get('summary', ''), 72)}"
+            )
+            if blocker.get("action_requested"):
+                click.echo(f"{INDENT}    {_dim('action')} {_truncate(blocker['action_requested'], 76)}")
+            click.echo(f"{INDENT}    {_dim('id')} {blocker.get('blocker_id', '')}")
+
+    if previews:
+        click.echo(f"{INDENT}{_cyan('previews')} {len(previews)}")
+        for preview in previews[:5]:
+            click.echo(
+                f"{INDENT}  {_cyan('>')} {_dim(preview.get('label', 'preview'))} "
+                f"{_s(preview.get('status', 'ready'))} {_truncate(preview.get('url', ''), 72)}"
+            )
+            if preview.get("note"):
+                click.echo(f"{INDENT}    {_dim('note')} {_truncate(preview['note'], 76)}")
+
+    if deployments:
+        click.echo(f"{INDENT}{_magenta('deployments')} {len(deployments)}")
+        for deployment in deployments[:5]:
+            verify = deployment.get("verification_status", "unknown")
+            click.echo(
+                f"{INDENT}  {_magenta('>')} {_dim(deployment.get('environment', 'env'))} "
+                f"{_s(deployment.get('status', 'deployed'))} {_truncate(deployment.get('url', ''), 72)}"
+            )
+            click.echo(f"{INDENT}    {_dim('verify')} {_truncate(verify, 76)}")
+            if deployment.get("note"):
+                click.echo(f"{INDENT}    {_dim('note')} {_truncate(deployment['note'], 76)}")
 
 
 def _print_work_items(store: StateStore, run_id: str) -> None:
@@ -1441,23 +1891,26 @@ def _print_blocker_lines(blockers: list[dict[str, Any]], limit: int | None) -> N
         click.echo(f"{INDENT}    {_dim(f'+{len(blockers) - limit} more blocker(s)')}")
 
 
-def _print_inbox_lines(inbox: list[dict[str, Any]], limit: int | None) -> None:
+def _print_inbox_lines(inbox: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
     subset = inbox[:limit] if limit is not None else inbox
     for item in subset:
         request = item["request"]
         domain = item.get("domain_name")
         domain_tag = f" {_magenta(domain)}" if domain else ""
         click.echo(
-            f"{INDENT}  {_blue('>')} {request.get('kind', 'request')}{domain_tag} "
+            f"{INDENT}  {_blue('>')} {_dim(item.get('board_handle', ''))} {request.get('kind', 'request')}{domain_tag} "
             f"{_dim(item['request_id'])} {_truncate(request.get('summary', ''), 72)}"
         )
         if request.get("action_requested"):
             click.echo(f"{INDENT}    {_dim('action')} {_truncate(request['action_requested'], 76)}")
+        if show_actions:
+            click.echo(f"{INDENT}    {_dim('reply')} /answer {item.get('board_handle', item['request_id'])} ...")
+            click.echo(f"{INDENT}    {_dim('open')} /inspect {item.get('board_handle', item['request_id'])}")
     if limit is not None and len(inbox) > limit:
         click.echo(f"{INDENT}    {_dim(f'+{len(inbox) - limit} more inbox item(s)')}")
 
 
-def _print_downstream_task_lines(work_items: list[dict[str, Any]], limit: int | None) -> None:
+def _print_downstream_task_lines(work_items: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
     subset = work_items[:limit] if limit is not None else work_items
     for item in subset:
         task = item["task"]
@@ -1465,10 +1918,30 @@ def _print_downstream_task_lines(work_items: list[dict[str, Any]], limit: int | 
         domain_tag = f" {_magenta(domain)}" if domain else ""
         summary = task.get("summary") or task.get("task_spec", "")
         click.echo(
-            f"{INDENT}  {_magenta('>')} {task.get('kind', 'task')}{domain_tag} "
-            f"{_dim(item['node_id'][:12])} {_truncate(summary, 72)}"
+            f"{INDENT}  {_magenta('>')} {_dim(item.get('board_handle', ''))} {task.get('kind', 'task')}{domain_tag} "
+            f"{_dim(item['node_id'])} {_truncate(summary, 72)}"
         )
         if task.get("task_spec") and task.get("task_spec") != summary:
             click.echo(f"{INDENT}    {_dim('details')} {_truncate(task['task_spec'], 76)}")
+        if show_actions:
+            click.echo(f"{INDENT}    {_dim('open')} /inspect {item.get('board_handle', item['node_id'])}")
     if limit is not None and len(work_items) > limit:
         click.echo(f"{INDENT}    {_dim(f'+{len(work_items) - limit} more work item(s)')}")
+
+
+def _print_recent_result_lines(results: list[dict[str, Any]], limit: int | None, show_actions: bool = False) -> None:
+    subset = results[:limit] if limit is not None else results
+    for item in subset:
+        domain = item.get("domain_name")
+        domain_tag = f" {_magenta(domain)}" if domain else ""
+        summary = item.get("summary") or item.get("status", "")
+        status = item.get("status", "")
+        click.echo(
+            f"{INDENT}  {_green('>')} {_dim(item.get('board_handle', ''))} {item.get('kind', 'result')}{domain_tag} "
+            f"{_dim(item['node_id'])} {_truncate(summary, 72)}"
+            + (f" {_dim(f'[{status}]')}" if status else "")
+        )
+        if show_actions:
+            click.echo(f"{INDENT}    {_dim('open')} /inspect {item.get('board_handle', item['node_id'])}")
+    if limit is not None and len(results) > limit:
+        click.echo(f"{INDENT}    {_dim(f'+{len(results) - limit} more result(s)')}")

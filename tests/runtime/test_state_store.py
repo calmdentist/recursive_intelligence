@@ -22,11 +22,13 @@ class TestRuns:
         assert run.run_id.startswith("run-")
         assert run.status == "running"
         assert run.telemetry["user_interruptions_count"] == 0
+        assert run.delivery["release"]["status"] == "draft"
 
         fetched = store.get_run(run.run_id)
         assert fetched is not None
         assert fetched.task == "fix the bug"
         assert fetched.telemetry["root_escalations_count"] == 0
+        assert fetched.delivery["previews"] == []
 
     def test_finish_run(self, store):
         run = store.create_run("/tmp/repo", "task")
@@ -68,6 +70,7 @@ class TestRuns:
             assert fetched is not None
             assert fetched.test_command == "pytest"
             assert fetched.telemetry["human_inputs_count"] == 0
+            assert fetched.delivery["release"]["status"] == "draft"
         finally:
             store.close()
 
@@ -383,6 +386,169 @@ class TestEvents:
         tasks = store.get_run_downstream_tasks(run.run_id)
         assert len(tasks) == 2
         assert {item["task"]["kind"] for item in tasks} == {"revision", "reactivation"}
+
+    def test_get_recent_run_results_includes_execution_and_task_results(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "child task")
+        store.append_event(run.run_id, node.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "added auth"},
+        })
+        store.append_event(run.run_id, node.node_id, "downstream_task_result", {
+            "kind": "merge_conflict",
+            "status": "completed",
+            "summary": "resolved README conflict",
+        })
+
+        results = store.get_recent_run_results(run.run_id)
+        assert len(results) == 2
+        assert results[0]["kind"] == "merge_conflict"
+        assert results[1]["kind"] == "execution"
+
+    def test_get_node_recent_results_returns_node_scoped_history(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        first = store.create_node(run.run_id, "first task")
+        second = store.create_node(run.run_id, "second task")
+        store.append_event(run.run_id, first.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "first result"},
+        })
+        store.append_event(run.run_id, second.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "second result"},
+        })
+
+        results = store.get_node_recent_results(first.node_id)
+        assert len(results) == 1
+        assert results[0]["summary"] == "first result"
+
+    def test_get_run_work_board_groups_sections(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        child = store.create_node(run.run_id, "child task", parent_id=root.node_id)
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.EXECUTING)
+        store.transition_node(child.node_id, NodeState.PAUSED, {
+            "request": {"kind": "clarification", "summary": "Need API choice"},
+        })
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-123",
+                "kind": "clarification",
+                "summary": "Need API choice",
+            },
+            "source_child_id": child.node_id,
+        })
+        store.append_event(run.run_id, child.node_id, "downstream_task", {
+            "kind": "revision",
+            "summary": "Add tests",
+            "task_spec": "write tests",
+        })
+        store.append_event(run.run_id, root.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "planned architecture"},
+        })
+
+        board = store.get_run_work_board(run.run_id)
+        assert board["run"] is not None
+        assert len(board["inbox"]) == 1
+        assert len(board["downstream_tasks"]) == 1
+        assert len(board["recent_results"]) == 1
+        assert board["inbox"][0]["board_handle"] == "i1"
+        assert board["downstream_tasks"][0]["board_handle"] == "w1"
+        assert board["recent_results"][0]["board_handle"] == "r1"
+
+    def test_get_run_board_item_resolves_handle(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        child = store.create_node(run.run_id, "child task", parent_id=root.node_id)
+        store.set_root_node(run.run_id, root.node_id)
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-123",
+                "kind": "clarification",
+                "summary": "Need copy direction",
+            },
+            "source_child_id": child.node_id,
+        })
+        store.append_event(run.run_id, child.node_id, "downstream_task", {
+            "kind": "revision",
+            "summary": "Add tests",
+            "task_spec": "write tests",
+        })
+
+        inbox_item = store.get_run_board_item(run.run_id, "i1")
+        work_item = store.get_run_board_item(run.run_id, "w1")
+        assert inbox_item is not None
+        assert inbox_item["request"]["summary"] == "Need copy direction"
+        assert work_item is not None
+        assert work_item["task"]["kind"] == "revision"
+        assert store.get_run_board_item(run.run_id, "missing") is None
+
+    def test_get_run_readiness_reports_ready_completed_run(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(root.node_id, NodeState.PLANNING)
+        store.transition_node(root.node_id, NodeState.EXECUTING)
+        store.transition_node(root.node_id, NodeState.COMPLETED)
+        store.finish_run(run.run_id, "completed")
+
+        readiness = store.get_run_readiness(run.run_id)
+        assert readiness["ready"] is True
+        assert readiness["blockers"] == []
+
+    def test_get_run_readiness_reports_blockers(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        root = store.create_node(run.run_id, "root task")
+        child = store.create_node(run.run_id, "child task", parent_id=root.node_id)
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.FAILED, {
+            "request": {"kind": "clarification", "summary": "Need API key"},
+        })
+        store.append_event(run.run_id, root.node_id, "root_request_upstream", {
+            "request": {
+                "request_id": "req-123",
+                "kind": "clarification",
+                "summary": "Need API key",
+            },
+            "source_child_id": child.node_id,
+        })
+        store.append_event(run.run_id, child.node_id, "downstream_task", {
+            "kind": "revision",
+            "summary": "Fix tests",
+            "task_spec": "repair test failures",
+        })
+        store.append_event(run.run_id, child.node_id, "verification_result", {
+            "passed": False,
+            "test_command": "pytest",
+            "output": "boom",
+            "attempt": 1,
+        })
+        store.increment_run_telemetry(run.run_id, ownership_violations_count=1)
+        store.add_delivery_blocker(
+            run.run_id,
+            kind="deploy_credentials",
+            summary="Missing deploy token",
+            action_requested="Add the deploy token before release.",
+        )
+        store.set_release_status(run.run_id, "blocked", note="Waiting on deploy token")
+
+        readiness = store.get_run_readiness(run.run_id)
+        assert readiness["ready"] is False
+        assert readiness["inbox_count"] == 1
+        assert readiness["downstream_task_count"] == 1
+        assert readiness["failed_node_count"] == 1
+        assert readiness["ownership_violations_count"] == 1
+        assert readiness["delivery_blocker_count"] == 1
+        assert readiness["recent_failures"][0]["kind"] == "verification"
+        assert {item["kind"] for item in readiness["blockers"]} == {
+            "inbox_requests",
+            "downstream_tasks",
+            "failed_nodes",
+            "recent_failures",
+            "ownership_violations",
+            "delivery_blockers",
+            "release_blocked",
+        }
 
 
 class TestIdempotency:

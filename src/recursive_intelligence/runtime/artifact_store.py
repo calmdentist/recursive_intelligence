@@ -38,8 +38,19 @@ class ArtifactStore:
         p.write_text(json.dumps(report, indent=2))
         return p
 
+    def save_delivery_state(self, run_id: str, delivery: dict[str, Any]) -> Path:
+        p = self.run_dir(run_id) / "delivery.json"
+        p.write_text(json.dumps(delivery, indent=2))
+        return p
+
     def load_report(self, run_id: str) -> dict[str, Any] | None:
         p = self.run_dir(run_id) / "report.json"
+        if p.exists():
+            return json.loads(p.read_text())
+        return None
+
+    def load_delivery_state(self, run_id: str) -> dict[str, Any] | None:
+        p = self.run_dir(run_id) / "delivery.json"
         if p.exists():
             return json.loads(p.read_text())
         return None
