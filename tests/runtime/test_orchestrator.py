@@ -7,6 +7,8 @@ import pytest
 
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult
 from recursive_intelligence.config import RuntimeConfig
+from recursive_intelligence.git.worktrees import create_worktree
+from recursive_intelligence.runtime.node_fsm import NodeFSM
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
 from recursive_intelligence.runtime.state_store import NodeState, StateStore
 
@@ -61,7 +63,9 @@ class NoopAdapter(AgentAdapter):
 
 
 def _make_commit(worktree: Path, filename: str, message: str) -> None:
-    (worktree / filename).write_text(f"content of {filename}\n")
+    target = worktree / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"content of {filename}\n")
     subprocess.run(["git", "add", "."], cwd=str(worktree), capture_output=True)
     subprocess.run(["git", "commit", "-m", message], cwd=str(worktree), capture_output=True)
 
@@ -261,6 +265,73 @@ class TestRecursiveFlow:
         store.close()
 
     @pytest.mark.asyncio
+    async def test_child_verification_runs_before_parent_merge(self, git_repo):
+        config = RuntimeConfig(repo_root=git_repo, max_parallel_children=1)
+
+        class ReviewRecordingAdapter(ScriptedAdapter):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.full_calls: list[dict] = []
+
+            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+                self.full_calls.append({"prompt": prompt, "mode": mode, "worktree": str(worktree)})
+                return await super().run(
+                    prompt,
+                    worktree,
+                    mode,
+                    system_prompt=system_prompt,
+                    resume_session_id=resume_session_id,
+                    on_message=on_message,
+                    is_root=is_root,
+                )
+
+        adapter = ReviewRecordingAdapter([
+            {
+                "action": "spawn_children",
+                "rationale": "delegate focused work",
+                "children": [
+                    {
+                        "idempotency_key": "child-a",
+                        "objective": "implement A",
+                        "success_criteria": ["A exists"],
+                        "verification_command": "sh -c 'test -f a.txt'",
+                        "verification_notes": "A should be created in the child worktree",
+                    },
+                ],
+            },
+            {"action": "solve_directly", "rationale": "simple"},
+            {"status": "implemented", "summary": "added A",
+             "_commit": True, "_commit_file": "a.txt", "_commit_msg": "add A"},
+            {"verdict": "accept", "reason": "looks good"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build A")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        child = store.get_children(root.node_id)[0]
+        child_verify = [
+            e for e in store.get_node_events(child.node_id)
+            if e.event_type == "verification_result"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert child.state == NodeState.COMPLETED
+        assert len(child_verify) == 1
+        assert child_verify[0].data["passed"] is True
+        assert child_verify[0].data["test_command"] == "sh -c 'test -f a.txt'"
+        assert (Path(root.worktree_path) / "a.txt").exists()
+        review_calls = [call for call in adapter.full_calls if call["mode"] == "review"]
+        assert len(review_calls) == 1
+        assert "## Local Verification" in review_calls[0]["prompt"]
+        assert "Status: passed" in review_calls[0]["prompt"]
+        assert "Command: sh -c 'test -f a.txt'" in review_calls[0]["prompt"]
+        store.close()
+
+    @pytest.mark.asyncio
     async def test_tree_output(self, config):
         adapter = ScriptedAdapter([
             {"action": "spawn_children", "rationale": "split",
@@ -284,6 +355,155 @@ class TestRecursiveFlow:
         assert len(root["children"]) == 1
         assert root["children"][0]["state"] == "completed"
         store.close()
+
+    @pytest.mark.asyncio
+    async def test_execution_prompt_includes_dependency_handoff_context(self, config):
+        config.ensure_dirs()
+        store = StateStore(config.db_path)
+        run = store.create_run(str(config.repo_root), "coordinate domains")
+        root = store.create_node(
+            run.run_id,
+            "parent task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/root",
+        )
+        store.set_root_node(run.run_id, root.node_id)
+
+        backend = store.create_node(run.run_id, "backend task", parent_id=root.node_id)
+        store.update_node(backend.node_id, metadata={
+            "child_slot": "backend",
+            "domain_name": "backend",
+            "interface_contract": "Expose GET /api/items",
+            "handoff_artifacts": ["src/backend/api.py"],
+        })
+        store.append_event(run.run_id, backend.node_id, "execution_result", {
+            "raw": {
+                "status": "implemented",
+                "summary": "backend endpoints ready",
+                "handoff": {
+                    "summary": "Frontend can call GET /api/items",
+                    "interfaces": ["GET /api/items"],
+                    "artifacts": ["src/backend/api.py"],
+                    "breaking_changes": [],
+                },
+            },
+        })
+
+        frontend = store.create_node(run.run_id, "frontend task", parent_id=root.node_id)
+        store.update_node(frontend.node_id, metadata={
+            "child_slot": "frontend",
+            "domain_name": "frontend",
+            "depends_on": ["backend"],
+            "interface_contract": "Consume GET /api/items",
+            "handoff_artifacts": ["src/ui/items.tsx"],
+        })
+        frontend = store.get_node(frontend.node_id)
+
+        orch = Orchestrator(config, NoopAdapter())
+        orch.store = store
+        prompt = orch._build_execution_prompt(frontend, run)
+
+        assert "## Coordination Contract" in prompt
+        assert "Depends on: backend" in prompt
+        assert "Interface contract: Consume GET /api/items" in prompt
+        assert "Handoff artifacts: src/ui/items.tsx" in prompt
+        assert "Dependency context:" in prompt
+        assert "- backend: backend endpoints ready" in prompt
+        assert "Handoff: Frontend can call GET /api/items" in prompt
+        assert "Interfaces: GET /api/items" in prompt
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_review_prompt_includes_coordination_contract_and_dependency_context(self, git_repo):
+        config = RuntimeConfig(repo_root=git_repo, max_parallel_children=1)
+
+        class ReviewRecordingAdapter(ScriptedAdapter):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.full_calls: list[dict] = []
+
+            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+                self.full_calls.append({"prompt": prompt, "mode": mode, "worktree": str(worktree)})
+                return await super().run(
+                    prompt,
+                    worktree,
+                    mode,
+                    system_prompt=system_prompt,
+                    resume_session_id=resume_session_id,
+                    on_message=on_message,
+                    is_root=is_root,
+                )
+
+        adapter = ReviewRecordingAdapter([
+            {
+                "action": "spawn_children",
+                "rationale": "split stack",
+                "children": [
+                    {
+                        "idempotency_key": "backend",
+                        "objective": "build backend",
+                        "domain_name": "backend",
+                        "file_patterns": ["src/backend/**"],
+                        "interface_contract": "Expose GET /api/items",
+                        "handoff_artifacts": ["src/backend/api.py"],
+                    },
+                    {
+                        "idempotency_key": "frontend",
+                        "objective": "build frontend",
+                        "domain_name": "frontend",
+                        "file_patterns": ["src/ui/**"],
+                        "depends_on": ["backend"],
+                        "interface_contract": "Consume GET /api/items",
+                        "handoff_artifacts": ["src/ui/items.tsx"],
+                    },
+                ],
+            },
+            {"action": "solve_directly", "rationale": "backend work"},
+            {
+                "status": "implemented",
+                "summary": "backend ready",
+                "handoff": {
+                    "summary": "Frontend can call GET /api/items",
+                    "interfaces": ["GET /api/items"],
+                    "artifacts": ["src/backend/api.py"],
+                    "breaking_changes": [],
+                },
+                "_commit": True,
+                "_commit_file": "src/backend/api.py",
+                "_commit_msg": "backend",
+            },
+            {"action": "solve_directly", "rationale": "frontend work"},
+            {
+                "status": "implemented",
+                "summary": "frontend ready",
+                "_commit": True,
+                "_commit_file": "src/ui/items.tsx",
+                "_commit_msg": "frontend",
+            },
+            {"verdict": "accept", "reason": "backend ok"},
+            {"verdict": "accept", "reason": "frontend ok"},
+        ])
+
+        (git_repo / "src").mkdir()
+        (git_repo / "src" / "backend").mkdir()
+        (git_repo / "src" / "ui").mkdir()
+        subprocess.run(["git", "add", "."], cwd=git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add src dirs"], cwd=git_repo, capture_output=True)
+
+        orch = Orchestrator(config, adapter)
+        await orch.start_run("build frontend and backend")
+
+        review_calls = [call for call in adapter.full_calls if call["mode"] == "review"]
+        assert len(review_calls) == 2
+        frontend_review = review_calls[1]["prompt"]
+        assert "## Coordination Contract" in frontend_review
+        assert "Depends on: backend" in frontend_review
+        assert "Interface contract: Consume GET /api/items" in frontend_review
+        assert "Handoff artifacts: src/ui/items.tsx" in frontend_review
+        assert "Dependency context:" in frontend_review
+        assert "- backend: backend ready" in frontend_review
+        assert "Handoff: Frontend can call GET /api/items" in frontend_review
+        assert "Interfaces: GET /api/items" in frontend_review
 
 
 class TestReviseLoop:
@@ -872,49 +1092,313 @@ class TestEscalations:
 
 class TestOwnershipEnforcement:
     @pytest.mark.asyncio
-    async def test_merge_fails_when_child_changes_out_of_scope_files(self, config):
-        adapter = ScriptedAdapter([
-            {
-                "action": "spawn_children",
-                "rationale": "split frontend work",
-                "children": [
-                    {
-                        "idempotency_key": "frontend",
-                        "objective": "update frontend",
-                        "success_criteria": ["frontend works"],
-                        "domain_name": "frontend",
-                        "file_patterns": ["src/ui/**"],
-                    },
-                ],
-            },
-            {"action": "solve_directly", "rationale": "straightforward"},
-            {
-                "status": "implemented",
-                "summary": "changed the server instead",
-                "_commit": True,
-                "_commit_file": "server.py",
-                "_commit_msg": "oops out of scope",
-            },
-            {"verdict": "accept", "reason": "accepted by reviewer"},
-        ])
-
-        orch = Orchestrator(config, adapter)
-        run_id = await orch.start_run("update the frontend")
-
+    async def test_review_auto_revises_when_child_changes_out_of_scope_files(self, config):
+        config.ensure_dirs()
         store = StateStore(config.db_path)
-        run = store.get_run(run_id)
-        root = store.get_node(run.root_node_id)
-        violation_events = [
-            e for e in store.get_node_events(root.node_id)
-            if e.event_type == "ownership_violation"
+        run = store.create_run(str(config.repo_root), "review frontend child")
+        root = store.create_node(
+            run.run_id,
+            "parent task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/root",
+        )
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(root.node_id, NodeState.PLANNING)
+        store.transition_node(root.node_id, NodeState.WAITING_ON_CHILDREN)
+
+        child_wt = create_worktree(
+            config.repo_root,
+            config.worktrees_dir,
+            f"{run.run_id}-ownership-review-child",
+            "ri/ownership-review-child",
+        )
+        child = store.create_node(
+            run.run_id,
+            "frontend task",
+            parent_id=root.node_id,
+            worktree_path=str(child_wt),
+            branch_name="ri/ownership-review-child",
+        )
+        store.update_node(child.node_id, metadata={
+            "domain_name": "frontend",
+            "file_patterns": ["src/ui/**"],
+            "module_scope": "frontend UI files",
+        })
+        store.register_domain(
+            run.run_id,
+            root.node_id,
+            child.node_id,
+            "frontend",
+            ["src/ui/**"],
+            "frontend UI files",
+        )
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.EXECUTING)
+        _make_commit(Path(child_wt), "server.py", "out of scope")
+        store.append_event(run.run_id, child.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "touched the server", "changed_files": ["server.py"]},
+        })
+        store.transition_node(child.node_id, NodeState.COMPLETED, {
+            "status": "implemented",
+            "summary": "touched the server",
+        })
+
+        store.transition_node(root.node_id, NodeState.REVIEWING_CHILDREN)
+        root_id = root.node_id
+        child_id = child.node_id
+        store.close()
+
+        orch = Orchestrator(config, NoopAdapter())
+        orch.store = StateStore(config.db_path)
+        await orch._run_review(NodeFSM(orch.store, root_id))
+
+        root = orch.store.get_node(root_id)
+        child_events = orch.store.get_node_events(child_id)
+        root_events = orch.store.get_node_events(root_id)
+        revisions = [
+            e for e in child_events
+            if e.event_type == "downstream_task" and e.data.get("kind") == "revision"
+        ]
+        skipped = [
+            e for e in root_events
+            if e.event_type == "review_skipped_for_ownership"
         ]
 
-        assert run.status == "failed"
+        assert root.state == NodeState.WAITING_ON_CHILDREN
+        assert len(revisions) == 1
+        assert "Files outside scope: server.py" in revisions[0].data["task_spec"]
+        assert "Allowed files: src/ui/**" in revisions[0].data["task_spec"]
+        assert len(skipped) == 1
+        assert skipped[0].data["violations"] == ["server.py"]
+        orch.store.close()
+
+    @pytest.mark.asyncio
+    async def test_review_auto_revises_when_child_verification_is_missing(self, config):
+        config.ensure_dirs()
+        store = StateStore(config.db_path)
+        run = store.create_run(str(config.repo_root), "review verified child")
+        root = store.create_node(
+            run.run_id,
+            "parent task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/root",
+        )
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(root.node_id, NodeState.PLANNING)
+        store.transition_node(root.node_id, NodeState.WAITING_ON_CHILDREN)
+
+        child_wt = create_worktree(
+            config.repo_root,
+            config.worktrees_dir,
+            f"{run.run_id}-review-child",
+            "ri/review-child",
+        )
+        child = store.create_node(
+            run.run_id,
+            "child task",
+            parent_id=root.node_id,
+            worktree_path=str(child_wt),
+            branch_name="ri/review-child",
+        )
+        store.update_node(child.node_id, metadata={
+            "verification_command": "sh -c 'test -f child.txt'",
+            "verification_notes": "Child must produce child.txt",
+        })
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.EXECUTING)
+        _make_commit(Path(child_wt), "child.txt", "child change")
+        store.append_event(run.run_id, child.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "added child", "changed_files": ["child.txt"]},
+        })
+        store.transition_node(child.node_id, NodeState.COMPLETED, {
+            "status": "implemented",
+            "summary": "added child",
+        })
+
+        store.transition_node(root.node_id, NodeState.REVIEWING_CHILDREN)
+        root_id = root.node_id
+        child_id = child.node_id
+        store.close()
+
+        orch = Orchestrator(config, NoopAdapter())
+        orch.store = StateStore(config.db_path)
+        await orch._run_review(NodeFSM(orch.store, root_id))
+
+        root = orch.store.get_node(root_id)
+        child_events = orch.store.get_node_events(child_id)
+        root_events = orch.store.get_node_events(root_id)
+        revisions = [
+            e for e in child_events
+            if e.event_type == "downstream_task" and e.data.get("kind") == "revision"
+        ]
+        skipped = [
+            e for e in root_events
+            if e.event_type == "review_skipped_for_verification"
+        ]
+
+        assert root.state == NodeState.WAITING_ON_CHILDREN
+        assert len(revisions) == 1
+        assert "Get the focused local verification passing" in revisions[0].data["task_spec"]
+        assert "sh -c 'test -f child.txt'" in revisions[0].data["task_spec"]
+        assert len(skipped) == 1
+        assert skipped[0].data["verification"]["status"] == "missing"
+        orch.store.close()
+
+    @pytest.mark.asyncio
+    async def test_merge_fails_closed_when_child_changes_out_of_scope_files(self, config):
+        config.ensure_dirs()
+        store = StateStore(config.db_path)
+        run = store.create_run(str(config.repo_root), "integrate frontend child")
+        root = store.create_node(
+            run.run_id,
+            "parent task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/root",
+        )
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(root.node_id, NodeState.PLANNING)
+        store.transition_node(root.node_id, NodeState.WAITING_ON_CHILDREN)
+
+        child_wt = create_worktree(
+            config.repo_root,
+            config.worktrees_dir,
+            f"{run.run_id}-ownership-merge-child",
+            "ri/ownership-merge-child",
+        )
+        child = store.create_node(
+            run.run_id,
+            "frontend task",
+            parent_id=root.node_id,
+            worktree_path=str(child_wt),
+            branch_name="ri/ownership-merge-child",
+        )
+        store.update_node(child.node_id, metadata={
+            "domain_name": "frontend",
+            "file_patterns": ["src/ui/**"],
+            "module_scope": "frontend UI files",
+        })
+        store.register_domain(
+            run.run_id,
+            root.node_id,
+            child.node_id,
+            "frontend",
+            ["src/ui/**"],
+            "frontend UI files",
+        )
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.EXECUTING)
+        _make_commit(Path(child_wt), "server.py", "out of scope")
+        store.append_event(run.run_id, child.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "touched the server", "changed_files": ["server.py"]},
+        })
+        store.transition_node(child.node_id, NodeState.COMPLETED, {
+            "status": "implemented",
+            "summary": "touched the server",
+        })
+
+        store.transition_node(root.node_id, NodeState.REVIEWING_CHILDREN)
+        store.append_event(run.run_id, root.node_id, "review_verdict", {
+            "child_id": child.node_id,
+            "verdict": "accept",
+            "reason": "accepted for integration",
+        })
+        store.transition_node(root.node_id, NodeState.MERGING)
+        root_id = root.node_id
+        store.close()
+
+        orch = Orchestrator(config, NoopAdapter())
+        orch.store = StateStore(config.db_path)
+        await orch._run_merge(NodeFSM(orch.store, root_id))
+
+        root = orch.store.get_node(root_id)
+        root_events = orch.store.get_node_events(root_id)
+        violation_events = [
+            e for e in root_events
+            if e.event_type == "ownership_violation"
+        ]
+        integrated_events = [
+            e for e in root_events
+            if e.event_type == "child_integrated"
+        ]
+
         assert root.state == NodeState.FAILED
-        assert run.telemetry["ownership_violations_count"] == 1
         assert len(violation_events) == 1
         assert violation_events[0].data["violations"] == ["server.py"]
+        assert integrated_events == []
+        orch.store.close()
+
+    @pytest.mark.asyncio
+    async def test_merge_fails_closed_when_child_lacks_passing_local_verification(self, config):
+        config.ensure_dirs()
+        store = StateStore(config.db_path)
+        run = store.create_run(str(config.repo_root), "integrate verified child")
+        root = store.create_node(
+            run.run_id,
+            "parent task",
+            worktree_path=str(config.repo_root),
+            branch_name="ri/root",
+        )
+        store.set_root_node(run.run_id, root.node_id)
+        store.transition_node(root.node_id, NodeState.PLANNING)
+        store.transition_node(root.node_id, NodeState.WAITING_ON_CHILDREN)
+
+        child_wt = create_worktree(
+            config.repo_root,
+            config.worktrees_dir,
+            f"{run.run_id}-verify-child",
+            "ri/verify-child",
+        )
+        child = store.create_node(
+            run.run_id,
+            "child task",
+            parent_id=root.node_id,
+            worktree_path=str(child_wt),
+            branch_name="ri/verify-child",
+        )
+        store.update_node(child.node_id, metadata={
+            "verification_command": "sh -c 'test -f child.txt'",
+        })
+        store.transition_node(child.node_id, NodeState.PLANNING)
+        store.transition_node(child.node_id, NodeState.EXECUTING)
+        _make_commit(Path(child_wt), "child.txt", "child change")
+        store.append_event(run.run_id, child.node_id, "execution_result", {
+            "raw": {"status": "implemented", "summary": "added child", "changed_files": ["child.txt"]},
+        })
+        store.transition_node(child.node_id, NodeState.COMPLETED, {
+            "status": "implemented",
+            "summary": "added child",
+        })
+
+        store.transition_node(root.node_id, NodeState.REVIEWING_CHILDREN)
+        store.append_event(run.run_id, root.node_id, "review_verdict", {
+            "child_id": child.node_id,
+            "verdict": "accept",
+            "reason": "accepted for integration",
+        })
+        store.transition_node(root.node_id, NodeState.MERGING)
+        root_id = root.node_id
         store.close()
+
+        orch = Orchestrator(config, NoopAdapter())
+        orch.store = StateStore(config.db_path)
+        await orch._run_merge(NodeFSM(orch.store, root_id))
+
+        root = orch.store.get_node(root_id)
+        gate_events = [
+            e for e in orch.store.get_node_events(root.node_id)
+            if e.event_type == "verification_gate_failed"
+        ]
+        integrated_events = [
+            e for e in orch.store.get_node_events(root.node_id)
+            if e.event_type == "child_integrated"
+        ]
+
+        assert root.state == NodeState.FAILED
+        assert len(gate_events) == 1
+        assert gate_events[0].data["child_id"] == child.node_id
+        assert gate_events[0].data["required_command"] == "sh -c 'test -f child.txt'"
+        assert integrated_events == []
+        orch.store.close()
 
 
 class TestWorktreeCleanup:

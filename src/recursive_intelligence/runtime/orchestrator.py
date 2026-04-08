@@ -465,12 +465,19 @@ class Orchestrator:
         for d in domains:
             child = store.get_node(d.child_node_id)
             child_summary = ""
+            handoff_summary = ""
+            interface_contract = ""
+            depends_on: list[str] = []
             if child:
                 child_events = store.get_node_events(child.node_id)
                 for evt in reversed(child_events):
                     if evt.event_type == "execution_result":
                         child_summary = evt.data.get("raw", {}).get("summary", "")
                         break
+                child_coordination = self._coordination_contract_for(child)
+                depends_on = child_coordination["depends_on"]
+                interface_contract = child_coordination["interface_contract"]
+                handoff_summary = self._latest_handoff_for(child)["summary"]
             domain_dicts.append({
                 "domain_name": d.domain_name,
                 "child_node_id": d.child_node_id,
@@ -478,6 +485,9 @@ class Orchestrator:
                 "module_scope": d.module_scope,
                 "child_state": child.state.value if child else "unknown",
                 "last_summary": child_summary,
+                "depends_on": depends_on,
+                "interface_contract": interface_contract,
+                "handoff_summary": handoff_summary,
             })
 
         return routing_prompt(user_input, domain_dicts, run.pass_count)
@@ -525,7 +535,261 @@ class Orchestrator:
                 pending_event = None
         return pending_event
 
-    def _build_downstream_task_prompt(self, node, task_data: dict[str, Any]) -> str:
+    def _success_criteria_for(self, node) -> list[str]:
+        criteria = (node.metadata or {}).get("success_criteria", [])
+        return criteria if isinstance(criteria, list) else []
+
+    def _verification_notes_for(self, node) -> str:
+        notes = (node.metadata or {}).get("verification_notes", "")
+        return notes.strip() if isinstance(notes, str) else ""
+
+    def _ownership_contract_for(self, node) -> dict[str, Any]:
+        store = self._ensure_store()
+        metadata = node.metadata or {}
+        domain = store.get_domain_by_child(node.node_id)
+
+        file_patterns = metadata.get("file_patterns") or []
+        if not isinstance(file_patterns, list):
+            file_patterns = []
+        if domain and not file_patterns:
+            file_patterns = domain.file_patterns
+
+        module_scope = metadata.get("module_scope", "")
+        if not isinstance(module_scope, str):
+            module_scope = ""
+        if domain and not module_scope:
+            module_scope = domain.module_scope
+
+        domain_name = metadata.get("domain_name", "")
+        if not isinstance(domain_name, str):
+            domain_name = ""
+        if domain and not domain_name:
+            domain_name = domain.domain_name
+
+        return {
+            "domain_name": domain_name.strip(),
+            "module_scope": module_scope.strip(),
+            "file_patterns": file_patterns,
+        }
+
+    def _coordination_contract_for(self, node) -> dict[str, Any]:
+        metadata = node.metadata or {}
+        depends_on = metadata.get("depends_on") or []
+        if not isinstance(depends_on, list):
+            depends_on = []
+        handoff_artifacts = metadata.get("handoff_artifacts") or []
+        if not isinstance(handoff_artifacts, list):
+            handoff_artifacts = []
+        interface_contract = metadata.get("interface_contract", "")
+        if not isinstance(interface_contract, str):
+            interface_contract = ""
+        child_slot = metadata.get("child_slot", "")
+        if not isinstance(child_slot, str):
+            child_slot = ""
+        return {
+            "child_slot": child_slot.strip(),
+            "depends_on": [dep for dep in depends_on if isinstance(dep, str) and dep.strip()],
+            "interface_contract": interface_contract.strip(),
+            "handoff_artifacts": [item for item in handoff_artifacts if isinstance(item, str) and item.strip()],
+        }
+
+    def _latest_execution_payload(self, node) -> dict[str, Any]:
+        store = self._ensure_store()
+        for event in reversed(store.get_node_events(node.node_id)):
+            if event.event_type == "execution_result":
+                raw = event.data.get("raw", {})
+                return raw if isinstance(raw, dict) else {}
+        return {}
+
+    def _latest_handoff_for(self, node) -> dict[str, Any]:
+        payload = self._latest_execution_payload(node)
+        handoff = payload.get("handoff", {})
+        if not isinstance(handoff, dict):
+            handoff = {}
+        interfaces = handoff.get("interfaces") or []
+        if not isinstance(interfaces, list):
+            interfaces = []
+        artifacts = handoff.get("artifacts") or []
+        if not isinstance(artifacts, list):
+            artifacts = []
+        breaking_changes = handoff.get("breaking_changes") or []
+        if not isinstance(breaking_changes, list):
+            breaking_changes = []
+        return {
+            "summary": handoff.get("summary", ""),
+            "interfaces": [item for item in interfaces if isinstance(item, str) and item.strip()],
+            "artifacts": [item for item in artifacts if isinstance(item, str) and item.strip()],
+            "breaking_changes": [item for item in breaking_changes if isinstance(item, str) and item.strip()],
+            "execution_summary": payload.get("summary", ""),
+        }
+
+    def _dependency_context_for(self, node) -> list[dict[str, Any]]:
+        store = self._ensure_store()
+        if not node.parent_id:
+            return []
+        contract = self._coordination_contract_for(node)
+        if not contract["depends_on"]:
+            return []
+        siblings = store.get_children(node.parent_id)
+        items: list[dict[str, Any]] = []
+        for dependency in contract["depends_on"]:
+            target = None
+            for sibling in siblings:
+                if sibling.node_id == node.node_id:
+                    continue
+                sibling_contract = self._coordination_contract_for(sibling)
+                sibling_ownership = self._ownership_contract_for(sibling)
+                if dependency in {
+                    sibling.node_id,
+                    sibling_contract["child_slot"],
+                    sibling_ownership["domain_name"],
+                }:
+                    target = sibling
+                    break
+            if target is None:
+                items.append({
+                    "dependency": dependency,
+                    "summary": "Dependency not found in current sibling set.",
+                    "handoff_summary": "",
+                    "interfaces": [],
+                    "breaking_changes": [],
+                })
+                continue
+            handoff = self._latest_handoff_for(target)
+            items.append({
+                "dependency": dependency,
+                "summary": handoff["execution_summary"] or f"Sibling state: {target.state.value}",
+                "handoff_summary": handoff["summary"],
+                "interfaces": handoff["interfaces"],
+                "breaking_changes": handoff["breaking_changes"],
+                "artifacts": handoff["artifacts"],
+                "state": target.state.value,
+            })
+        return items
+
+    def _verification_command_for(self, node, run) -> str | None:
+        command = (node.metadata or {}).get("verification_command", "")
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+        if run and run.root_node_id == node.node_id and run.test_command:
+            return run.test_command.strip()
+        return None
+
+    def _build_execution_prompt(self, node, run) -> str:
+        ownership = self._ownership_contract_for(node)
+        coordination = self._coordination_contract_for(node)
+        return execution_prompt(
+            node.task_spec,
+            is_root=self._is_root(node.node_id),
+            success_criteria=self._success_criteria_for(node),
+            verification_command=self._verification_command_for(node, run),
+            verification_notes=self._verification_notes_for(node),
+            domain_name=ownership["domain_name"],
+            module_scope=ownership["module_scope"],
+            file_patterns=ownership["file_patterns"],
+            depends_on=coordination["depends_on"],
+            interface_contract=coordination["interface_contract"],
+            handoff_artifacts=coordination["handoff_artifacts"],
+            dependency_context=self._dependency_context_for(node),
+        )
+
+    def _latest_verification_result_after_execution(self, node) -> dict[str, Any] | None:
+        store = self._ensure_store()
+        for event in reversed(store.get_node_events(node.node_id)):
+            if event.event_type == "verification_result":
+                return event.data
+            if event.event_type == "execution_result":
+                return None
+        return None
+
+    def _local_verification_status(self, node, run) -> dict[str, Any]:
+        command = self._verification_command_for(node, run)
+        notes = self._verification_notes_for(node)
+        if not command:
+            return {
+                "required": False,
+                "status": "not_required",
+                "command": "",
+                "notes": notes,
+                "output": "",
+            }
+
+        latest = self._latest_verification_result_after_execution(node)
+        if latest and latest.get("test_command") == command:
+            return {
+                "required": True,
+                "status": "passed" if latest.get("passed") else "failed",
+                "command": command,
+                "notes": notes,
+                "output": latest.get("output", ""),
+                "attempt": latest.get("attempt", 0),
+            }
+
+        return {
+            "required": True,
+            "status": "missing",
+            "command": command,
+            "notes": notes,
+            "output": "",
+            "attempt": 0,
+        }
+
+    def _build_verification_follow_up(self, verification: dict[str, Any]) -> str:
+        lines = ["Get the focused local verification passing before asking for review again."]
+        if verification.get("command"):
+            lines.append(f"Run: {verification['command']}")
+        if verification.get("notes"):
+            lines.append(f"Notes: {verification['notes']}")
+        if verification.get("status") == "failed" and verification.get("output"):
+            lines.append("Latest failing output:")
+            lines.append(verification["output"][:4000])
+        return "\n".join(lines)
+
+    def _build_ownership_follow_up(
+        self,
+        ownership: dict[str, Any],
+        changed_files: list[str],
+        scope_violations: list[str],
+    ) -> str:
+        lines = [
+            "Bring this child back inside its ownership boundary before asking for review again.",
+            f"Files outside scope: {', '.join(scope_violations)}",
+        ]
+        if ownership.get("file_patterns"):
+            lines.append(f"Allowed files: {', '.join(ownership['file_patterns'])}")
+        if ownership.get("module_scope"):
+            lines.append(f"Module scope: {ownership['module_scope']}")
+        if changed_files:
+            lines.append(f"Current changed files: {', '.join(changed_files)}")
+        return "\n".join(lines)
+
+    def _queue_child_revision(self, parent_node, child, verdict: ReviewVerdict) -> None:
+        self._append_downstream_task(
+            child.run_id,
+            child.node_id,
+            "revision",
+            summary=verdict.reason or "Review requested changes",
+            task_spec=verdict.follow_up,
+            reason=verdict.reason,
+            requested_by=parent_node.node_id,
+            source_child_id=child.node_id,
+        )
+
+    def _build_downstream_task_prompt(self, node, run, task_data: dict[str, Any]) -> str:
+        ownership = self._ownership_contract_for(node)
+        coordination = self._coordination_contract_for(node)
+        contract_kwargs = {
+            "success_criteria": self._success_criteria_for(node),
+            "verification_command": self._verification_command_for(node, run),
+            "verification_notes": self._verification_notes_for(node),
+            "domain_name": ownership["domain_name"],
+            "module_scope": ownership["module_scope"],
+            "file_patterns": ownership["file_patterns"],
+            "depends_on": coordination["depends_on"],
+            "interface_contract": coordination["interface_contract"],
+            "handoff_artifacts": coordination["handoff_artifacts"],
+            "dependency_context": self._dependency_context_for(node),
+        }
         task_kind = task_data.get("kind", "")
         if task_kind == "reactivation":
             return reactivation_prompt(
@@ -533,11 +797,13 @@ class Orchestrator:
                 previous_summary=task_data.get("previous_summary", ""),
                 new_task=task_data.get("task_spec", ""),
                 is_root=self._is_root(node.node_id),
+                **contract_kwargs,
             )
         if task_kind == "revision":
             return revision_prompt(
                 task_data.get("task_spec", ""),
                 is_root=self._is_root(node.node_id),
+                **contract_kwargs,
             )
         if task_kind == "merge_conflict":
             return conflict_resolution_prompt(
@@ -545,7 +811,7 @@ class Orchestrator:
                 task_data.get("conflict_files", []),
                 task_data.get("conflict_diff", ""),
             )
-        return execution_prompt(node.task_spec, is_root=self._is_root(node.node_id))
+        return self._build_execution_prompt(node, run)
 
     # --- Execution ---
 
@@ -553,12 +819,16 @@ class Orchestrator:
         node = fsm.node
         store = self._ensure_store()
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
+        run = store.get_run(node.run_id)
+        ownership = self._ownership_contract_for(node)
+        coordination = self._coordination_contract_for(node)
+        dependency_context = self._dependency_context_for(node)
 
         events = store.get_node_events(node.node_id)
         pending_event = self._latest_pending_work_event(events)
 
         if pending_event and pending_event.event_type == "downstream_task":
-            prompt = self._build_downstream_task_prompt(node, pending_event.data)
+            prompt = self._build_downstream_task_prompt(node, run, pending_event.data)
             resume_id = node.session_id
         elif pending_event and pending_event.event_type == "reactivation_requested":
             prompt = reactivation_prompt(
@@ -566,12 +836,32 @@ class Orchestrator:
                 previous_summary=pending_event.data.get("previous_summary", ""),
                 new_task=pending_event.data.get("new_task", ""),
                 is_root=self._is_root(node.node_id),
+                success_criteria=self._success_criteria_for(node),
+                verification_command=self._verification_command_for(node, run),
+                verification_notes=self._verification_notes_for(node),
+                domain_name=ownership["domain_name"],
+                module_scope=ownership["module_scope"],
+                file_patterns=ownership["file_patterns"],
+                depends_on=coordination["depends_on"],
+                interface_contract=coordination["interface_contract"],
+                handoff_artifacts=coordination["handoff_artifacts"],
+                dependency_context=dependency_context,
             )
             resume_id = node.session_id
         elif pending_event and pending_event.event_type == "revision_requested":
             prompt = revision_prompt(
                 pending_event.data.get("follow_up", ""),
                 is_root=self._is_root(node.node_id),
+                success_criteria=self._success_criteria_for(node),
+                verification_command=self._verification_command_for(node, run),
+                verification_notes=self._verification_notes_for(node),
+                domain_name=ownership["domain_name"],
+                module_scope=ownership["module_scope"],
+                file_patterns=ownership["file_patterns"],
+                depends_on=coordination["depends_on"],
+                interface_contract=coordination["interface_contract"],
+                handoff_artifacts=coordination["handoff_artifacts"],
+                dependency_context=dependency_context,
             )
             resume_id = node.session_id
         elif pending_event and pending_event.event_type == "response_downstream":
@@ -582,10 +872,20 @@ class Orchestrator:
                 original_details=request.get("details", ""),
                 resolution=pending_event.data.get("resolution", "answer"),
                 is_root=self._is_root(node.node_id),
+                success_criteria=self._success_criteria_for(node),
+                verification_command=self._verification_command_for(node, run),
+                verification_notes=self._verification_notes_for(node),
+                domain_name=ownership["domain_name"],
+                module_scope=ownership["module_scope"],
+                file_patterns=ownership["file_patterns"],
+                depends_on=coordination["depends_on"],
+                interface_contract=coordination["interface_contract"],
+                handoff_artifacts=coordination["handoff_artifacts"],
+                dependency_context=dependency_context,
             )
             resume_id = node.session_id
         else:
-            prompt = execution_prompt(node.task_spec, is_root=self._is_root(node.node_id))
+            prompt = self._build_execution_prompt(node, run)
             resume_id = None
 
         try:
@@ -638,7 +938,6 @@ class Orchestrator:
         if execution.changed_files:
             self._update_domain_from_changed_files(node, execution.changed_files)
 
-        run = store.get_run(node.run_id)
         should_verify = self._should_verify(node, run)
         log.info("Node %s execution: %s (verify=%s)", node.node_id, execution.status, should_verify)
         fsm.finish_execution(execution, verify=should_verify)
@@ -810,6 +1109,7 @@ class Orchestrator:
     async def _run_review(self, fsm: NodeFSM) -> None:
         store = self._ensure_store()
         node = fsm.node
+        run = store.get_run(node.run_id)
         children = store.get_children(node.node_id)
 
         spawn_events = [
@@ -886,10 +1186,59 @@ class Orchestrator:
                     child_summary = evt.data.get("raw", {}).get("summary", "")
                     break
 
+            verification = self._local_verification_status(child, run)
+            if verification["required"] and verification["status"] != "passed":
+                reason = "Child local verification is not passing"
+                if verification["status"] == "missing":
+                    reason = "Child local verification has not been run"
+                store.append_event(node.run_id, node.node_id, "review_skipped_for_verification", {
+                    "child_id": child.node_id,
+                    "verification": verification,
+                })
+                verdict = ReviewVerdict(
+                    child_id=child.node_id,
+                    verdict="revise",
+                    reason=reason,
+                    follow_up=self._build_verification_follow_up(verification),
+                )
+                self._queue_child_revision(node, child, verdict)
+                fsm.apply_review_verdict(verdict)
+                if fsm.node.state == NodeState.WAITING_ON_CHILDREN:
+                    return
+                continue
+
             bundle = build_artifact_bundle(
                 node_id=child.node_id, worktree=child_wt,
                 base_ref=diff_base, summary=child_summary,
             )
+            ownership = self._ownership_contract_for(child)
+            coordination = self._coordination_contract_for(child)
+            scope_violations = find_scope_violations(
+                bundle.changed_files,
+                ownership["file_patterns"],
+            )
+            if scope_violations:
+                store.append_event(node.run_id, node.node_id, "review_skipped_for_ownership", {
+                    "child_id": child.node_id,
+                    "ownership": ownership,
+                    "changed_files": bundle.changed_files,
+                    "violations": scope_violations,
+                })
+                verdict = ReviewVerdict(
+                    child_id=child.node_id,
+                    verdict="revise",
+                    reason="Child changed files outside its ownership boundary",
+                    follow_up=self._build_ownership_follow_up(
+                        ownership,
+                        bundle.changed_files,
+                        scope_violations,
+                    ),
+                )
+                self._queue_child_revision(node, child, verdict)
+                fsm.apply_review_verdict(verdict)
+                if fsm.node.state == NodeState.WAITING_ON_CHILDREN:
+                    return
+                continue
 
             criteria = criteria_by_child.get(child.node_id, [])
 
@@ -897,6 +1246,15 @@ class Orchestrator:
                 child_id=child.node_id, diff=bundle.diff[:8000],
                 summary=bundle.summary or child_summary,
                 success_criteria=criteria,
+                verification=verification,
+                ownership={
+                    **ownership,
+                    "changed_files": bundle.changed_files,
+                },
+                coordination={
+                    **coordination,
+                    "dependency_context": self._dependency_context_for(child),
+                },
             )
 
             try:
@@ -922,16 +1280,7 @@ class Orchestrator:
             log.info("Node %s review of %s: %s", node.node_id, child.node_id, verdict.verdict)
 
             if verdict.verdict == "revise":
-                self._append_downstream_task(
-                    child.run_id,
-                    child.node_id,
-                    "revision",
-                    summary=verdict.reason or "Review requested changes",
-                    task_spec=verdict.follow_up,
-                    reason=verdict.reason,
-                    requested_by=node.node_id,
-                    source_child_id=child.node_id,
-                )
+                self._queue_child_revision(node, child, verdict)
 
             fsm.apply_review_verdict(verdict)
 
@@ -983,6 +1332,18 @@ class Orchestrator:
         for child in children:
             if child.node_id not in accepted_ids or not child.worktree_path:
                 continue
+
+            required_command = self._verification_command_for(child, run)
+            if required_command and not self._has_passing_local_verification(child):
+                store.append_event(node.run_id, node.node_id, "verification_gate_failed", {
+                    "child_id": child.node_id,
+                    "required_command": required_command,
+                })
+                fsm.fail(
+                    f"Child {child.node_id} lacks a passing local verification result",
+                    failure_type="verification_gate_failed",
+                )
+                return
 
             child_wt = Path(child.worktree_path)
             child_sha = get_head_sha(child_wt)
@@ -1118,7 +1479,8 @@ class Orchestrator:
             conflict_diff=conflict_diff,
             requested_by=node.node_id,
         )
-        prompt = self._build_downstream_task_prompt(node, task_data)
+        run = store.get_run(node.run_id)
+        prompt = self._build_downstream_task_prompt(node, run, task_data)
 
         log.info("Asking parent %s to resolve conflict with %s (%s)",
                  node.node_id, child_id, conflict_files)
@@ -1219,8 +1581,9 @@ class Orchestrator:
         node = fsm.node
         run = store.get_run(node.run_id)
         should_verify = self._should_verify(node, run)
+        test_command = self._verification_command_for(node, run)
 
-        if not run or not run.test_command or not should_verify:
+        if not run or not test_command or not should_verify:
             log.info("Node %s: no test command, skipping verification", node.node_id)
             is_root = run and run.root_node_id == node.node_id
             persistent_root = is_root and run.persistent if run else False
@@ -1228,7 +1591,6 @@ class Orchestrator:
             return
 
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
-        test_command = run.test_command
 
         log.info("Node %s: running verification: %s", node.node_id, test_command)
 
@@ -1288,7 +1650,7 @@ class Orchestrator:
 
         # Find the most recent verification_result event
         test_output = ""
-        test_command = run.test_command or ""
+        test_command = self._verification_command_for(node, run) or ""
         for e in reversed(events):
             if e.event_type == "verification_result":
                 test_output = e.data.get("output", "")
@@ -1304,7 +1666,11 @@ class Orchestrator:
         )
 
     def _should_verify(self, node, run) -> bool:
-        return bool(run and run.test_command and run.root_node_id == node.node_id)
+        return bool(self._verification_command_for(node, run))
+
+    def _has_passing_local_verification(self, node) -> bool:
+        latest = self._latest_verification_result_after_execution(node)
+        return bool(latest and latest.get("passed") is True)
 
     # --- Cleanup ---
 
@@ -1343,6 +1709,11 @@ class Orchestrator:
                     domain_name=c.get("domain_name"),
                     file_patterns=c.get("file_patterns"),
                     module_scope=c.get("module_scope"),
+                    depends_on=c.get("depends_on", []),
+                    interface_contract=c.get("interface_contract", ""),
+                    handoff_artifacts=c.get("handoff_artifacts", []),
+                    verification_command=c.get("verification_command"),
+                    verification_notes=c.get("verification_notes", ""),
                 )
                 for i, c in enumerate(raw["children"])
             ]

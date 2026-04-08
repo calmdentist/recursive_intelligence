@@ -31,6 +31,11 @@ class ChildSpec:
     domain_name: str | None = None
     file_patterns: list[str] | None = None
     module_scope: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    interface_contract: str = ""
+    handoff_artifacts: list[str] = field(default_factory=list)
+    verification_command: str | None = None
+    verification_notes: str = ""
 
 
 @dataclass
@@ -290,7 +295,29 @@ class NodeFSM:
             "task_hash": task_hash,
             "objective": spec.objective,
             "success_criteria": spec.success_criteria,
+            "domain_name": spec.domain_name or "",
+            "file_patterns": spec.file_patterns or [],
+            "module_scope": spec.module_scope or "",
+            "depends_on": spec.depends_on,
+            "interface_contract": spec.interface_contract,
+            "handoff_artifacts": spec.handoff_artifacts,
+            "verification_command": spec.verification_command or "",
+            "verification_notes": spec.verification_notes,
         })
+
+        child_metadata = {
+            "child_slot": spec.idempotency_key,
+            "success_criteria": spec.success_criteria,
+            "domain_name": spec.domain_name or "",
+            "file_patterns": spec.file_patterns or [],
+            "module_scope": spec.module_scope or "",
+            "depends_on": spec.depends_on,
+            "interface_contract": spec.interface_contract,
+            "handoff_artifacts": spec.handoff_artifacts,
+            "verification_command": spec.verification_command or "",
+            "verification_notes": spec.verification_notes,
+        }
+        self.store.update_node(child.node_id, metadata=child_metadata)
 
         # Register domain if provided
         if spec.domain_name:
