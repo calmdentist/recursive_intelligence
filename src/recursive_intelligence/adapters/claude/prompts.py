@@ -13,16 +13,97 @@ You are a node in a recursive coding-agent runtime. You work in an isolated git 
 """
 
 
-def planning_prompt(task_spec: str, file_scope: list[str] | None = None) -> str:
+ROOT_SYSTEM_CONTRACT = """\
+You are the root node in a recursive coding-agent runtime. You are also the only node
+the human sees directly in the UI.
+
+- Keep your streamed messages conversational and plain-English.
+- Do not expose raw JSON envelopes, tool chatter, or internal control-plane jargon to the human.
+- Give short progress updates before or between major steps when useful.
+- Commit work before finishing.
+- End each phase with a single JSON object. No wrapping text or markdown around it.
+"""
+
+
+def _completion_option(allow_pause: bool) -> str:
+    if allow_pause:
+        return 'Pause and wait for more instructions:\n{"action": "pause", "rationale": "..."}'
+    return 'Done:\n{"action": "done", "rationale": "..."}'
+
+
+def _bullet_section(title: str, lines: list[str] | None, empty_message: str) -> str:
+    rendered = [str(line).strip() for line in (lines or []) if str(line).strip()]
+    if not rendered:
+        rendered = [empty_message]
+    body = "\n".join(f"- {line}" for line in rendered)
+    return f"## {title}\n{body}"
+
+
+def _ownership_section(title: str, entries: list[dict[str, Any]] | None, empty_message: str) -> str:
+    if not entries:
+        return _bullet_section(title, None, empty_message)
+
+    lines = []
+    for entry in entries:
+        scope = entry.get("domain_name") or entry.get("label") or "unnamed scope"
+        details = [entry.get("availability", "").strip()]
+        if entry.get("state"):
+            details.append(f"state: {entry['state']}")
+        if entry.get("module_scope"):
+            details.append(str(entry["module_scope"]).strip())
+        if entry.get("file_patterns"):
+            details.append(f"files: {', '.join(entry['file_patterns'])}")
+        if entry.get("summary"):
+            details.append(f"summary: {entry['summary']}")
+        detail_text = "; ".join(part for part in details if part)
+        lines.append(f"{scope} — {detail_text}" if detail_text else scope)
+    return _bullet_section(title, lines, empty_message)
+
+
+def planning_prompt(
+    task_spec: str,
+    file_scope: list[str] | None = None,
+    snapshot_summary: list[str] | None = None,
+    ownership_context: list[dict[str, Any]] | None = None,
+    *,
+    allow_pause: bool = False,
+) -> str:
     scope = ""
     if file_scope:
         scope = f"\nRelevant files: {', '.join(file_scope)}"
+    completion = _completion_option(allow_pause)
+    snapshot_block = _bullet_section(
+        "Current Snapshot",
+        snapshot_summary,
+        "No snapshot summary is available yet.",
+    )
+    ownership_block = _ownership_section(
+        "Nearby Ownership And Availability",
+        ownership_context,
+        "No nearby ownership context is recorded yet.",
+    )
 
     return f"""\
 Plan how to accomplish this task. Explore the repo first.
 {scope}
+{snapshot_block}
+
+{ownership_block}
+
 ## Task
 {task_spec}
+
+Decompose work into snapshot-independent waves, not just non-overlapping file scopes.
+A valid wave contains tasks that each child can complete using only the CURRENT parent
+snapshot. If some work requires new shared foundation, interfaces, or scaffolding,
+spawn only that prerequisite wave now. After those children merge, you will plan the
+next wave from the updated snapshot.
+Treat only ownership entries marked as merged/available as usable dependencies.
+Do not recreate foundation or modules that are already owned upstream or by a sibling.
+If another node owns a needed scope but it is not available yet, plan around that
+constraint instead of rebuilding it.
+If follow-up work belongs to a domain that is already owned nearby, keep that work with
+the existing owner instead of spawning a second child for the same domain.
 
 ## Respond with ONE of:
 
@@ -33,6 +114,7 @@ Split into children (give each child a distinct file scope):
 {{
   "action": "spawn_children",
   "rationale": "...",
+  "more_waves_expected": false,
   "children": [
     {{
       "idempotency_key": "slug",
@@ -44,6 +126,11 @@ Split into children (give each child a distinct file scope):
     }}
   ]
 }}
+
+Set "more_waves_expected": true only when this wave is intentionally a prerequisite wave
+and you expect to plan another wave after these children merge.
+
+{completion}
 """
 
 
@@ -54,22 +141,49 @@ def execution_prompt(task_spec: str) -> str:
 
 Implement this task. Commit when done.
 
+Return a concise manager handoff that helps the parent decide what to do next.
+The handoff should capture what changed, any risks, deviations, discoveries, and
+recommended follow-ups. Use empty arrays when a section has nothing important.
+
 On success:
-{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+{{
+  "status": "implemented",
+  "summary": "one-sentence outcome",
+  "changed_files": ["..."],
+  "commit_sha": "...",
+  "handoff": {{
+    "deliverables": ["what shipped"],
+    "notes": ["important implementation notes"],
+    "concerns": ["risks or caveats"],
+    "deviations": ["where you intentionally differed from the task"],
+    "findings": ["useful discoveries for the planner"],
+    "suggested_next_steps": ["recommended follow-up work"]
+  }}
+}}
 
 If blocked:
 {{"status": "blocked", "kind": "...", "recoverable": true, "details": "..."}}
 """
 
 
-def review_prompt(child_id: str, diff: str, summary: str, success_criteria: list[str]) -> str:
+def review_prompt(
+    child_id: str,
+    diff: str,
+    summary: str,
+    success_criteria: list[str],
+    handoff: str = "",
+) -> str:
     criteria_str = "\n".join(f"  - {c}" for c in success_criteria) if success_criteria else "  - (none specified)"
+    handoff_block = handoff or "(none)"
 
     return f"""\
 Review child {child_id}'s work against these criteria:
 {criteria_str}
 
 Summary: {summary or "(none)"}
+
+Worker handoff:
+{handoff_block}
 
 ```diff
 {diff}
@@ -88,11 +202,33 @@ Revision requested. Make these changes, commit, and return the result.
 
 Feedback: {follow_up}
 
-{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+{{
+  "status": "implemented",
+  "summary": "...",
+  "changed_files": ["..."],
+  "commit_sha": "...",
+  "handoff": {{
+    "deliverables": ["..."],
+    "notes": ["..."],
+    "concerns": [],
+    "deviations": [],
+    "findings": [],
+    "suggested_next_steps": []
+  }}
+}}
 """
 
 
-def routing_prompt(user_input: str, domains: list[dict[str, Any]], pass_number: int) -> str:
+def routing_prompt(
+    user_input: str,
+    domains: list[dict[str, Any]],
+    pass_number: int,
+    snapshot_summary: list[str] | None = None,
+    ownership_context: list[dict[str, Any]] | None = None,
+    merged_work: list[dict[str, Any]] | None = None,
+    *,
+    allow_pause: bool = False,
+) -> str:
     """Route follow-up work to existing children or spawn new ones."""
 
     if domains:
@@ -100,52 +236,97 @@ def routing_prompt(user_input: str, domains: list[dict[str, Any]], pass_number: 
         for d in domains:
             patterns = ", ".join(d.get("file_patterns", []))
             rows.append(
-                f"| {d['domain_name']} | {d['child_node_id'][:12]} | {patterns} | "
-                f"{d.get('child_state', '?')} | {d.get('last_summary', '')[:50]} |"
+                f"| {d['domain_name']} | {d['child_node_id'][:12]} | {d.get('availability', '?')} | "
+                f"{patterns} | {d.get('child_state', '?')} | {d.get('last_summary', '')[:50]} |"
             )
         domain_table = (
-            "| Domain | Child | Files | State | Summary |\n"
-            "| --- | --- | --- | --- | --- |\n"
+            "| Domain | Child | Availability | Files | State | Summary |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
             + "\n".join(rows)
         )
     else:
         domain_table = "(no children yet)"
+    completion = _completion_option(allow_pause)
+    snapshot_block = _bullet_section(
+        "Current Snapshot",
+        snapshot_summary,
+        "No snapshot summary is available yet.",
+    )
+    ownership_block = _ownership_section(
+        "Upstream Ownership Already In Scope",
+        ownership_context,
+        "No upstream ownership context is recorded yet.",
+    )
+    merged_block = _ownership_section(
+        "Previously Merged Child Work In This Branch",
+        merged_work,
+        "No child work has been merged into this branch yet.",
+    )
 
     return f"""\
 ## Department (pass {pass_number})
+
+{snapshot_block}
+
+{ownership_block}
+
+{merged_block}
 
 {domain_table}
 
 ## User request
 {user_input}
 
+You are a manager node with existing child domains. Do not implement code yourself.
+Previously accepted child work is already merged into your current worktree. New child
+tasks must be executable immediately against this snapshot. If a requested outcome depends
+on foundation that is not yet merged, spawn or route ONLY that prerequisite wave first.
+Only work marked as merged/available can be treated as a live dependency.
+Do not recreate domains that are already owned upstream or already merged here.
+If follow-up stays inside an existing child domain, route it back to that same child.
+Do not spawn a second child for dependent follow-up in the same domain.
+Route at most one task to each child in a single wave.
+
 ## Respond with ONE of:
 
 Route to existing children:
-{{"action": "route_to_children", "rationale": "...", "routes": [{{"child_node_id": "...", "domain_name": "...", "task_spec": "..."}}]}}
+{{"action": "route_to_children", "rationale": "...", "more_waves_expected": false, "routes": [{{"child_node_id": "...", "domain_name": "...", "task_spec": "..."}}]}}
 
 Spawn new children (for new scope):
-{{"action": "spawn_children", "rationale": "...", "children": [{{"idempotency_key": "...", "objective": "...", "success_criteria": [...], "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."}}]}}
+{{"action": "spawn_children", "rationale": "...", "more_waves_expected": false, "children": [{{"idempotency_key": "...", "objective": "...", "success_criteria": [...], "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."}}]}}
 
-Solve directly:
-{{"action": "solve_directly", "rationale": "..."}}
+Set "more_waves_expected": true only when this wave is intentionally a prerequisite wave
+and you need another planning pass after these children merge.
 
-Done:
-{{"action": "done", "rationale": "..."}}
+{completion}
 """
 
 
-def reactivation_prompt(original_task: str, previous_summary: str, new_task: str) -> str:
+def reactivation_prompt(original_task: str, previous_handoff: str, new_task: str) -> str:
     """Re-activate a child with follow-up work."""
 
     return f"""\
 You previously completed: {original_task}
-What you did: {previous_summary or "(unknown)"}
+Previous handoff:
+{previous_handoff or "(unknown)"}
 
 New task: {new_task}
 
 Implement the changes, commit, and return:
-{{"status": "implemented", "summary": "...", "changed_files": ["..."], "commit_sha": "..."}}
+{{
+  "status": "implemented",
+  "summary": "...",
+  "changed_files": ["..."],
+  "commit_sha": "...",
+  "handoff": {{
+    "deliverables": ["..."],
+    "notes": ["..."],
+    "concerns": [],
+    "deviations": [],
+    "findings": [],
+    "suggested_next_steps": []
+  }}
+}}
 """
 
 
@@ -161,15 +342,15 @@ def verification_retry_prompt(
         options = """\
 ## Respond with ONE of:
 
-Fix it yourself:
-{{"action": "solve_directly", "rationale": "..."}}
-
 Route fixes to the responsible children:
 {{
   "action": "route_to_children",
   "rationale": "...",
   "routes": [{{"child_node_id": "...", "domain_name": "...", "task_spec": "describe what the child should fix"}}]
-}}"""
+}}
+
+Spawn a new child if no existing domain cleanly owns the fix:
+{{"action": "spawn_children", "rationale": "...", "children": [{{"idempotency_key": "...", "objective": "...", "success_criteria": ["..."], "domain_name": "...", "file_patterns": ["..."], "module_scope": "..."}}]}}"""
     else:
         options = """\
 ## Respond with:

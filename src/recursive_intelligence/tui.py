@@ -26,6 +26,7 @@ from textual.widgets.tree import TreeNode
 from recursive_intelligence.config import RuntimeConfig
 from recursive_intelligence.runtime.orchestrator import Orchestrator, get_node_tree
 from recursive_intelligence.runtime.state_store import StateStore, NodeState
+from recursive_intelligence.ui_messages import human_visible_text
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ class RariApp(App):
         self.run_id = run_id
         self._orchestrator: Orchestrator | None = None
         self._busy = False
+        self._show_internal = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -120,7 +122,7 @@ class RariApp(App):
                 yield Tree("nodes", id="node-tree")
                 yield RichLog(id="detail", wrap=True, highlight=True, markup=True)
         yield Static("", id="status-bar")
-        yield Input(placeholder="type a task, or /tree /domains /status /help /quit", id="prompt")
+        yield Input(placeholder="type a task, or /tree /domains /status /debug /help /quit", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -180,6 +182,12 @@ class RariApp(App):
             self._show_status()
             return
 
+        if cmd == "/debug":
+            self._show_internal = not self._show_internal
+            state = "visible" if self._show_internal else "hidden"
+            output.write(f"[dim]internal trace {state}[/]")
+            return
+
         if cmd == "/done":
             if self.run_id:
                 self.ri_config.ensure_dirs()
@@ -194,6 +202,7 @@ class RariApp(App):
             output.write("[bold]/tree[/]     [dim]show/refresh the node tree[/]")
             output.write("[bold]/domains[/]  [dim]show domain registry[/]")
             output.write("[bold]/status[/]   [dim]show run status[/]")
+            output.write("[bold]/debug[/]    [dim]toggle internal tool/json trace[/]")
             output.write("[bold]/done[/]     [dim]finalize and exit[/]")
             output.write("[bold]/quit[/]     [dim]exit (run stays paused)[/]")
             output.write("[bold]ctrl+t[/]    [dim]refresh tree[/]")
@@ -236,37 +245,53 @@ class RariApp(App):
         """Render a streaming message in the output pane (main thread)."""
         output = self.query_one("#output", RichLog)
 
+        if msg_type == "status":
+            self._consume_status_event(data)
+
         if msg_type == "text":
             text = data.get("text", "")
-            if text.strip():
-                output.write(text)
+            rendered = text if self._show_internal else human_visible_text(text)
+            if rendered.strip():
+                output.write(rendered)
 
         elif msg_type == "thinking":
             text = data.get("text", "")
-            if text.strip():
-                preview = text.strip().split("\n")[0][:90]
-                output.write(f"[dim]━ {preview}{'...' if len(text) > 90 else ''}[/]")
+            if self._show_internal and text.strip():
+                output.write(f"[dim]━[/] [dim]{text.strip()}[/]")
 
         elif msg_type == "tool_use":
-            tool = data.get("tool", "")
-            inp = data.get("input", {})
-            arg = self._summarize_tool_input(tool, inp)
-            line = f"[cyan]▸ {tool}[/]"
-            if arg:
-                line += f" [dim]{arg}[/]"
-            output.write(line)
+            if self._show_internal:
+                tool = data.get("tool", "")
+                inp = data.get("input", {})
+                arg = self._summarize_tool_input(tool, inp)
+                line = f"[cyan]▸ {tool}[/]"
+                if arg:
+                    line += f" [dim]{arg}[/]"
+                output.write(line)
 
         elif msg_type == "tool_result":
             content = data.get("content", "")
-            if content.strip():
+            if self._show_internal and content.strip():
                 lines = content.strip().split("\n")
                 preview = lines[0][:100]
                 if len(lines) > 1:
                     preview += f" [dim](+{len(lines)-1} lines)[/]"
                 output.write(f"  [dim]{preview}[/]")
 
+        elif msg_type == "status":
+            line = self._format_status_message(data) if self._show_internal else ""
+            if line:
+                output.write(line)
+
         # Auto-refresh tree periodically during streaming
         self._refresh_tree()
+
+    def _consume_status_event(self, data: dict[str, Any]) -> None:
+        """Apply status events that should update local UI state."""
+        if data.get("event") == "run_created" and not self.run_id:
+            run_id = data.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                self.run_id = run_id
 
     def _on_pass_complete(self) -> None:
         output = self.query_one("#output", RichLog)
@@ -507,6 +532,57 @@ class RariApp(App):
         if tool == "Agent":
             return inp.get("description", "")[:40]
         return ""
+
+    @staticmethod
+    def _format_status_message(data: dict[str, Any]) -> str:
+        event = data.get("event", "")
+        node_id = str(data.get("node_id", ""))[:10]
+        parent_id = data.get("parent_id")
+        state = str(data.get("state", ""))
+        domain = data.get("domain")
+        task = str(data.get("task_spec", "")).strip().replace("\n", " ")
+        if len(task) > 60:
+            task = f"{task[:57]}..."
+
+        domain_tag = f" [magenta][{domain}][/]" if domain else ""
+
+        if event == "node_created":
+            role = "root" if not parent_id else "child"
+            line = f"[dim]◦ {role} {node_id}[/]{domain_tag}"
+            if task:
+                line += f" [dim]{task}[/]"
+            return line
+
+        if event != "state_changed":
+            return ""
+
+        show_line = bool(parent_id) or state in {
+            "waiting_on_children",
+            "reviewing_children",
+            "merging",
+            "paused",
+            "completed",
+            "failed",
+        }
+        if not show_line:
+            return ""
+
+        state_color = {
+            "completed": "green",
+            "failed": "red",
+            "paused": "yellow",
+            "waiting_on_children": "yellow",
+        }.get(state, "cyan")
+
+        role = "root" if not parent_id else "child"
+        line = f"[dim]◦ {role} {node_id}[/]{domain_tag} [{state_color}]{state}[/]"
+        child_count = data.get("child_count")
+        if state == "waiting_on_children" and isinstance(child_count, int) and child_count:
+            label = "child" if child_count == 1 else "children"
+            line += f" [dim]{child_count} {label}[/]"
+        if task:
+            line += f" [dim]{task}[/]"
+        return line
 
 
 def run_tui(config: RuntimeConfig, model: str, run_id: str | None = None) -> None:
