@@ -15,6 +15,7 @@ class PlanDecision:
 
     action: str  # solve_directly, spawn_children, route_to_children, pause, done
     rationale: str = ""
+    more_waves_expected: bool = False
     children: list[ChildSpec] | None = None
     file_scope: list[str] | None = None
     # For route_to_children: which existing children to reactivate
@@ -51,6 +52,29 @@ class ExecutionResult:
     changed_files: list[str] | None = None
     commit_sha: str | None = None
     blocker: BlockerInfo | None = None
+    handoff: WorkerHandoff | None = None
+
+
+@dataclass
+class WorkerHandoff:
+    """Structured worker-to-manager handoff after execution."""
+
+    deliverables: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    concerns: list[str] = field(default_factory=list)
+    deviations: list[str] = field(default_factory=list)
+    findings: list[str] = field(default_factory=list)
+    suggested_next_steps: list[str] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not any((
+            self.deliverables,
+            self.notes,
+            self.concerns,
+            self.deviations,
+            self.findings,
+            self.suggested_next_steps,
+        ))
 
 
 @dataclass
@@ -98,7 +122,11 @@ class NodeFSM:
 
     def apply_plan_decision(self, decision: PlanDecision) -> NodeRecord:
         """Apply a planning decision and transition accordingly."""
-        data: dict[str, Any] = {"action": decision.action, "rationale": decision.rationale}
+        data: dict[str, Any] = {
+            "action": decision.action,
+            "rationale": decision.rationale,
+            "more_waves_expected": decision.more_waves_expected,
+        }
 
         if decision.action == "solve_directly":
             return self.store.transition_node(self.node_id, NodeState.EXECUTING, data)
@@ -132,6 +160,15 @@ class NodeFSM:
             data["commit_sha"] = result.commit_sha
         if result.changed_files:
             data["changed_files"] = result.changed_files
+        if result.handoff and not result.handoff.is_empty():
+            data["handoff"] = {
+                "deliverables": result.handoff.deliverables,
+                "notes": result.handoff.notes,
+                "concerns": result.handoff.concerns,
+                "deviations": result.handoff.deviations,
+                "findings": result.handoff.findings,
+                "suggested_next_steps": result.handoff.suggested_next_steps,
+            }
 
         if result.status == "blocked":
             if result.blocker:
@@ -195,6 +232,12 @@ class NodeFSM:
         next_state = NodeState.VERIFYING if verify else NodeState.COMPLETED
         return self.store.transition_node(self.node_id, next_state, data)
 
+    def continue_planning_after_merge(self, commit_sha: str, verify: bool = False) -> NodeRecord:
+        """After merging a wave, verify if needed, otherwise re-plan from the new snapshot."""
+        data = {"merge_commit_sha": commit_sha, "reason": "merged_wave"}
+        next_state = NodeState.VERIFYING if verify else NodeState.PLANNING
+        return self.store.transition_node(self.node_id, next_state, data)
+
     def pause_after_merge(self, commit_sha: str, verify: bool = False) -> NodeRecord:
         """Pause after merge instead of completing — for persistent multi-pass runs.
 
@@ -207,10 +250,17 @@ class NodeFSM:
         data = {"merge_commit_sha": commit_sha}
         return self.store.transition_node(self.node_id, NodeState.PAUSED, data)
 
-    def finish_verify_pass(self, persistent_root: bool = False) -> NodeRecord:
+    def finish_verify_pass(
+        self,
+        persistent_root: bool = False,
+        continue_planning: bool = False,
+    ) -> NodeRecord:
         """Verification passed — complete or pause."""
         data = {"verification": "passed"}
-        next_state = NodeState.PAUSED if persistent_root else NodeState.COMPLETED
+        if continue_planning:
+            next_state = NodeState.PLANNING
+        else:
+            next_state = NodeState.PAUSED if persistent_root else NodeState.COMPLETED
         return self.store.transition_node(self.node_id, next_state, data)
 
     def finish_verify_fail(self, retries_remaining: int) -> NodeRecord:

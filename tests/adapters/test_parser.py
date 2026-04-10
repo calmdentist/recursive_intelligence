@@ -76,6 +76,15 @@ class TestParseExecutionResult:
         result = parse_execution_result(text)
         assert result["status"] == "implemented"
 
+    def test_implemented_with_handoff(self):
+        text = (
+            '{"status":"implemented","summary":"Done","commit_sha":"abc123",'
+            '"handoff":{"deliverables":["feature shipped"],"concerns":["needs tests"]}}'
+        )
+        result = parse_execution_result(text)
+        assert result["status"] == "implemented"
+        assert result["handoff"]["deliverables"] == ["feature shipped"]
+
     def test_blocked(self):
         text = '{"status": "blocked", "kind": "missing_dep", "details": "need lib"}'
         result = parse_execution_result(text)

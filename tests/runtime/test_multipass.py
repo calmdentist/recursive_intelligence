@@ -32,7 +32,12 @@ class ScriptedAdapter(AgentAdapter):
             raise RuntimeError(f"ScriptedAdapter ran out of responses (call #{len(self._call_log) + 1}, mode={mode})")
 
         resp = self._responses.pop(0)
-        self._call_log.append({"prompt": prompt[:200], "mode": mode, "worktree": str(worktree)})
+        self._call_log.append({
+            "prompt": prompt[:200],
+            "full_prompt": prompt,
+            "mode": mode,
+            "worktree": str(worktree),
+        })
 
         if resp.get("_commit"):
             _make_commit(Path(worktree), resp.get("_commit_file", "out.txt"), resp.get("_commit_msg", "mock"))
@@ -186,6 +191,59 @@ class TestPersistentRun:
         assert (root_wt / "hashing.py").exists()
         store.close()
 
+        manager_prompt = adapter.calls[4]["full_prompt"]
+        assert "Current Snapshot" in manager_prompt
+        assert "Previously Merged Child Work In This Branch" in manager_prompt
+        assert "auth" in manager_prompt
+        assert "merged into current snapshot" in manager_prompt
+
+    @pytest.mark.asyncio
+    async def test_reactivation_carries_previous_handoff(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "auth", "objective": "build auth",
+                  "success_criteria": ["works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "module_scope": "Auth module"},
+             ]},
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "built auth",
+             "handoff": {
+                 "deliverables": ["Auth login flow implemented"],
+                 "concerns": ["Password reset still missing"],
+                 "suggested_next_steps": ["Add password hashing"],
+             },
+             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+            {"verdict": "accept", "reason": "ok"},
+            {"action": "route_to_children", "rationale": "auth domain",
+             "routes": [{"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                         "task_spec": "add password hashing"}]},
+            {"status": "implemented", "summary": "added hashing",
+             "_commit": True, "_commit_file": "hashing.py", "_commit_msg": "add hashing"},
+            {"verdict": "accept", "reason": "ok"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build an app", persistent=True)
+
+        store = StateStore(config.db_path)
+        root = store.get_node(store.get_run(run_id).root_node_id)
+        child_id = store.get_children(root.node_id)[0].node_id
+        adapter._responses[0]["routes"][0]["child_node_id"] = child_id
+        store.close()
+
+        await orch.continue_run(run_id, "add password hashing to the auth module")
+
+        store = StateStore(config.db_path)
+        reactivation = [
+            e for e in store.get_node_events(child_id)
+            if e.event_type == "reactivation_requested"
+        ][0]
+        assert "Password reset still missing" in reactivation.data["previous_handoff"]
+        assert "Add password hashing" in reactivation.data["previous_handoff"]
+        store.close()
+
     @pytest.mark.asyncio
     async def test_continue_reuses_existing_planning_session(self, config):
         adapter = ScriptedAdapter([
@@ -232,6 +290,165 @@ class TestPersistentRun:
             conn.close()
 
         assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_manager_node_cannot_solve_directly_after_recursion(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "auth", "objective": "build auth",
+                  "success_criteria": ["works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "module_scope": "Auth module"},
+             ]},
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "built auth",
+             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+            {"verdict": "accept", "reason": "ok"},
+            {"action": "solve_directly", "rationale": "I'll just do it myself"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build an app", persistent=True)
+
+        store = StateStore(config.db_path)
+        root = store.get_node(store.get_run(run_id).root_node_id)
+        store.close()
+
+        await orch.continue_run(run_id, "add password hashing to the auth module")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(root.node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+        assert run.status == "failed"
+        assert root.state == NodeState.FAILED
+        assert len(invalid_events) == 1
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_continue_reuses_existing_domain_owner(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "auth", "objective": "build auth",
+                  "success_criteria": ["works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "module_scope": "Auth module"},
+             ]},
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "built auth",
+             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+            {"verdict": "accept", "reason": "ok"},
+            {"action": "spawn_children", "rationale": "follow-up auth work",
+             "children": [
+                 {"idempotency_key": "auth-v2", "objective": "add password hashing",
+                  "success_criteria": ["hashing works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py", "hashing.py"],
+                  "module_scope": "Auth module"},
+             ]},
+            {"action": "route_to_children", "rationale": "same auth owner",
+             "routes": [{"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                         "task_spec": "add password hashing"}]},
+            {"status": "implemented", "summary": "added hashing",
+             "_commit": True, "_commit_file": "hashing.py", "_commit_msg": "add hashing"},
+            {"verdict": "accept", "reason": "ok"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build an app", persistent=True)
+
+        store = StateStore(config.db_path)
+        root = store.get_node(store.get_run(run_id).root_node_id)
+        child_id = store.get_children(root.node_id)[0].node_id
+        adapter._responses[1]["routes"][0]["child_node_id"] = child_id
+        store.close()
+
+        await orch.continue_run(run_id, "add password hashing to the auth module")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        children = store.get_children(root.node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+        child_events = store.get_node_events(child_id)
+        exec_events = [e for e in child_events if e.event_type == "execution_result"]
+
+        assert run.status == "paused"
+        assert len(children) == 1
+        assert len(exec_events) == 2
+        assert len(invalid_events) == 1
+        assert "existing domain 'auth'" in invalid_events[0].data["reason"]
+        assert "spawning a second child" in invalid_events[0].data["reason"]
+
+        root_wt = Path(root.worktree_path)
+        assert (root_wt / "auth.py").exists()
+        assert (root_wt / "hashing.py").exists()
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_continue_routes_only_once_per_child_per_wave(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "auth", "objective": "build auth",
+                  "success_criteria": ["works"],
+                  "domain_name": "auth", "file_patterns": ["auth.py"],
+                  "module_scope": "Auth module"},
+             ]},
+            {"action": "solve_directly", "rationale": "ok"},
+            {"status": "implemented", "summary": "built auth",
+             "_commit": True, "_commit_file": "auth.py", "_commit_msg": "auth v1"},
+            {"verdict": "accept", "reason": "ok"},
+            {"action": "route_to_children", "rationale": "two dependent auth steps",
+             "routes": [
+                 {"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                  "task_spec": "add password hashing"},
+                 {"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                  "task_spec": "add password reset"},
+             ]},
+            {"action": "route_to_children", "rationale": "one combined auth step",
+             "routes": [{"child_node_id": "PLACEHOLDER", "domain_name": "auth",
+                         "task_spec": "add password hashing and reset support"}]},
+            {"status": "implemented", "summary": "added auth follow-up",
+             "_commit": True, "_commit_file": "auth_followup.py", "_commit_msg": "auth follow-up"},
+            {"verdict": "accept", "reason": "ok"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build an app", persistent=True)
+
+        store = StateStore(config.db_path)
+        root = store.get_node(store.get_run(run_id).root_node_id)
+        child_id = store.get_children(root.node_id)[0].node_id
+        adapter._responses[0]["routes"][0]["child_node_id"] = child_id
+        adapter._responses[0]["routes"][1]["child_node_id"] = child_id
+        adapter._responses[1]["routes"][0]["child_node_id"] = child_id
+        store.close()
+
+        await orch.continue_run(run_id, "extend the auth flow")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+        child_events = store.get_node_events(child_id)
+        exec_events = [e for e in child_events if e.event_type == "execution_result"]
+
+        assert run.status == "paused"
+        assert len(exec_events) == 2
+        assert len(invalid_events) == 1
+        assert "at most one task to each child" in invalid_events[0].data["reason"]
+        store.close()
 
     @pytest.mark.asyncio
     async def test_continue_spawns_new_child(self, config):

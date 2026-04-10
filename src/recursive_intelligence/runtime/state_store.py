@@ -64,6 +64,7 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
         NodeState.CANCELLED,
     },
     NodeState.MERGING: {
+        NodeState.PLANNING,
         NodeState.COMPLETED,
         NodeState.VERIFYING,
         NodeState.PAUSED,  # multi-pass: pause after merge

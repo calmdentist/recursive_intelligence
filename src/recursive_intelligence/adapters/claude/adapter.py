@@ -9,7 +9,7 @@ from typing import Any
 from recursive_intelligence.adapters.base import AgentAdapter, CostRecord, NodeResult, StreamCallback
 from recursive_intelligence.adapters.claude.parser import extract_json, ParseError
 from recursive_intelligence.adapters.claude.permissions import get_mode_config
-from recursive_intelligence.adapters.claude.prompts import SYSTEM_CONTRACT
+from recursive_intelligence.adapters.claude.prompts import ROOT_SYSTEM_CONTRACT, SYSTEM_CONTRACT
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class ClaudeAdapter(AgentAdapter):
         )
 
         mode_config = get_mode_config(mode)
-        sys_prompt = system_prompt or SYSTEM_CONTRACT
+        sys_prompt = system_prompt or (ROOT_SYSTEM_CONTRACT if is_root else SYSTEM_CONTRACT)
 
         model = self._model_for_node(is_root)
         betas = ["context-1m-2025-08-07"] if is_root else []

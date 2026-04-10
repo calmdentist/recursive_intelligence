@@ -51,11 +51,62 @@ from recursive_intelligence.runtime.node_fsm import (
     PlanDecision,
     ReviewVerdict,
     RouteSpec,
+    WorkerHandoff,
 )
 from recursive_intelligence.runtime.state_store import NodeState, StateStore
 from recursive_intelligence.test_commands import run_test_command
 
 log = logging.getLogger(__name__)
+
+FOUNDATION_WAVE_MARKERS = (
+    "bootstrap",
+    "scaffold",
+    "infrastructure",
+    "workspace",
+    "package.json",
+    "tsconfig",
+    "tailwind",
+    "postcss",
+    "next.config",
+    "schema",
+    "types",
+    "install required packages",
+    "root config",
+    "shared lib",
+    "shared types",
+)
+
+FEATURE_WAVE_MARKERS = (
+    "page",
+    "component",
+    "route handler",
+    "api",
+    "dashboard",
+    "settings",
+    "admin",
+    "beacon",
+    "match",
+    "intro",
+    "form",
+    "card",
+)
+
+DEPENDENCY_MARKERS = (
+    "using the",
+    "use the",
+    "from previous children",
+    "from previous child",
+    "from sibling",
+    "from other child",
+    "set up by",
+    "scaffold child",
+    "previous children",
+    "previous child",
+    "sibling task",
+    "other child",
+    "depends on",
+    "after the scaffold",
+)
 
 
 class Orchestrator:
@@ -67,6 +118,41 @@ class Orchestrator:
         self.store: StateStore | None = None
         self._on_message = on_message
         self._root_node_id: str | None = None
+
+    def _emit_status(self, data: dict[str, Any]) -> None:
+        """Send orchestrator lifecycle events to the UI/log stream."""
+        if not self._on_message:
+            return
+        try:
+            self._on_message("status", data)
+        except Exception:
+            pass
+
+    def _emit_node_status(
+        self,
+        node_id: str,
+        *,
+        event: str,
+        previous_state: str | None = None,
+    ) -> None:
+        store = self._ensure_store()
+        node = store.get_node(node_id)
+        if node is None:
+            return
+
+        domain = store.get_domain_by_child(node_id)
+        payload: dict[str, Any] = {
+            "event": event,
+            "node_id": node.node_id,
+            "parent_id": node.parent_id,
+            "state": node.state.value,
+            "task_spec": node.task_spec,
+            "domain": domain.domain_name if domain else None,
+            "child_count": len(store.get_children(node_id)),
+        }
+        if previous_state:
+            payload["previous_state"] = previous_state
+        self._emit_status(payload)
 
     def _is_root(self, node_id: str) -> bool:
         """Check if a node is the root node of its run."""
@@ -88,6 +174,516 @@ class Orchestrator:
         if node_id == self._root_node_id and self._on_message:
             return self._on_message
         return None
+
+    @staticmethod
+    def _list_of_strings(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @classmethod
+    def _handoff_from_raw(cls, raw: dict[str, Any]) -> WorkerHandoff | None:
+        handoff_raw = raw.get("handoff")
+        if not isinstance(handoff_raw, dict):
+            return None
+        handoff = WorkerHandoff(
+            deliverables=cls._list_of_strings(handoff_raw.get("deliverables")),
+            notes=cls._list_of_strings(handoff_raw.get("notes")),
+            concerns=cls._list_of_strings(handoff_raw.get("concerns")),
+            deviations=cls._list_of_strings(handoff_raw.get("deviations")),
+            findings=cls._list_of_strings(handoff_raw.get("findings")),
+            suggested_next_steps=cls._list_of_strings(handoff_raw.get("suggested_next_steps")),
+        )
+        return None if handoff.is_empty() else handoff
+
+    @classmethod
+    def _summary_from_raw(cls, raw: dict[str, Any]) -> str:
+        summary = str(raw.get("summary", "")).strip()
+        if summary:
+            return summary
+        handoff = cls._handoff_from_raw(raw)
+        if handoff and handoff.deliverables:
+            return handoff.deliverables[0]
+        return ""
+
+    @staticmethod
+    def _format_handoff_for_prompt(handoff: WorkerHandoff | None, fallback_summary: str = "") -> str:
+        sections: list[str] = []
+        if fallback_summary:
+            sections.append(f"Summary: {fallback_summary}")
+        if handoff is None:
+            return "\n".join(sections).strip()
+
+        field_map = [
+            ("Deliverables", handoff.deliverables),
+            ("Notes", handoff.notes),
+            ("Concerns", handoff.concerns),
+            ("Deviations", handoff.deviations),
+            ("Findings", handoff.findings),
+            ("Suggested next steps", handoff.suggested_next_steps),
+        ]
+        for label, items in field_map:
+            if items:
+                sections.append(f"{label}:")
+                sections.extend(f"- {item}" for item in items)
+        return "\n".join(sections).strip()
+
+    def _latest_execution_raw(self, node_id: str) -> dict[str, Any]:
+        return self._execution_raw_at_or_before(node_id)
+
+    def _execution_raw_at_or_before(self, node_id: str, timestamp: str | None = None) -> dict[str, Any]:
+        store = self._ensure_store()
+        for evt in reversed(store.get_node_events(node_id)):
+            if evt.event_type == "execution_result":
+                if timestamp and evt.timestamp > timestamp:
+                    continue
+                raw = evt.data.get("raw", {})
+                return raw if isinstance(raw, dict) else {}
+        return {}
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int = 140) -> str:
+        compact = " ".join(str(text).split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    def _git_lines(self, worktree: Path, *args: str) -> list[str]:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def _summarize_worktree_snapshot(self, worktree: Path) -> list[str]:
+        lines: list[str] = []
+        try:
+            lines.append(f"HEAD: {get_head_sha(worktree)[:8]}")
+        except Exception:
+            pass
+
+        recent_commits = [
+            self._truncate_text(line, limit=90)
+            for line in self._git_lines(worktree, "log", "--oneline", "--no-decorate", "-3")
+        ]
+        if recent_commits:
+            lines.append("Recent commits: " + " | ".join(recent_commits))
+
+        tracked_files = self._git_lines(worktree, "ls-files")
+        if tracked_files:
+            top_level_counts: dict[str, int] = {}
+            directory_roots: set[str] = set()
+            for rel_path in tracked_files:
+                top_level = rel_path.split("/", 1)[0]
+                top_level_counts[top_level] = top_level_counts.get(top_level, 0) + 1
+                if "/" in rel_path:
+                    directory_roots.add(top_level)
+            top_level_parts = []
+            for name, count in sorted(
+                top_level_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:8]:
+                if name in directory_roots:
+                    top_level_parts.append(f"{name}/ ({count} files)")
+                else:
+                    top_level_parts.append(name)
+            lines.append("Tracked paths: " + ", ".join(top_level_parts))
+        return lines
+
+    def _child_integrated_before(
+        self,
+        parent_node_id: str,
+        child_node_id: str,
+        timestamp: str | None = None,
+    ) -> bool:
+        store = self._ensure_store()
+        integrated = False
+        for event in store.get_node_events(parent_node_id):
+            if timestamp and event.timestamp > timestamp:
+                break
+            if event.event_type == "child_integrated" and event.data.get("child_id") == child_node_id:
+                if event.data.get("status") == "integrated":
+                    integrated = True
+            elif event.event_type == "conflict_resolved" and event.data.get("child_id") == child_node_id:
+                integrated = True
+        return integrated
+
+    def _build_context_entry(
+        self,
+        *,
+        owner_node_id: str,
+        label: str,
+        availability: str,
+        module_scope: str = "",
+        file_patterns: list[str] | None = None,
+        state: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "owner_node_id": owner_node_id,
+            "domain_name": label,
+            "availability": availability,
+            "module_scope": self._truncate_text(module_scope, limit=120) if module_scope else "",
+            "file_patterns": (file_patterns or [])[:6],
+            "state": state,
+            "summary": self._truncate_text(summary, limit=140) if summary else "",
+        }
+
+    def _collect_parent_ownership_context(self, node) -> list[dict[str, Any]]:
+        store = self._ensure_store()
+        if not node.parent_id:
+            return []
+
+        parent = store.get_node(node.parent_id)
+        if parent is None:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for sibling in store.get_children(parent.node_id):
+            if sibling.node_id == node.node_id:
+                continue
+
+            domain = store.get_domain_by_child(sibling.node_id)
+            raw = self._execution_raw_at_or_before(sibling.node_id, node.created_at)
+            summary = self._summary_from_raw(raw)
+            is_available = self._child_integrated_before(parent.node_id, sibling.node_id, node.created_at)
+            availability = (
+                "merged into current snapshot"
+                if is_available
+                else "owned elsewhere; not available yet"
+            )
+            label = domain.domain_name if domain else self._truncate_text(sibling.task_spec, limit=60)
+            module_scope = domain.module_scope if domain else sibling.task_spec
+            file_patterns = domain.file_patterns if domain else []
+            entries.append(self._build_context_entry(
+                owner_node_id=sibling.node_id,
+                label=label,
+                availability=availability,
+                module_scope=module_scope,
+                file_patterns=file_patterns,
+                state=sibling.state.value,
+                summary=summary,
+            ))
+
+        entries.sort(key=lambda entry: entry["availability"] != "merged into current snapshot")
+        return entries
+
+    def _collect_merged_child_context(
+        self,
+        manager_node_id: str,
+        *,
+        available_before: str | None = None,
+        availability_label: str,
+    ) -> list[dict[str, Any]]:
+        store = self._ensure_store()
+        latest_integrated: dict[str, str] = {}
+        for event in store.get_node_events(manager_node_id):
+            if available_before and event.timestamp > available_before:
+                break
+            if event.event_type == "child_integrated":
+                child_id = event.data.get("child_id")
+                status = event.data.get("status")
+                if status == "integrated":
+                    latest_integrated[child_id] = event.timestamp
+                elif status == "no_change" and child_id in latest_integrated:
+                    latest_integrated[child_id] = event.timestamp
+            elif event.event_type == "conflict_resolved":
+                child_id = event.data.get("child_id")
+                latest_integrated[child_id] = event.timestamp
+
+        entries: list[dict[str, Any]] = []
+        for child_id in latest_integrated:
+            child = store.get_node(child_id)
+            domain = store.get_domain_by_child(child_id)
+            raw = self._execution_raw_at_or_before(child_id, available_before)
+            summary = self._summary_from_raw(raw)
+            label = domain.domain_name if domain else self._truncate_text(child.task_spec if child else child_id, limit=60)
+            module_scope = domain.module_scope if domain else (child.task_spec if child else "")
+            file_patterns = domain.file_patterns if domain else []
+            state = child.state.value if child else "unknown"
+            entries.append(self._build_context_entry(
+                owner_node_id=child_id,
+                label=label,
+                availability=availability_label,
+                module_scope=module_scope,
+                file_patterns=file_patterns,
+                state=state,
+                summary=summary,
+            ))
+
+        return entries
+
+    def _collect_upstream_ownership_context(self, node) -> list[dict[str, Any]]:
+        store = self._ensure_store()
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        current_parent_id = node.parent_id
+        while current_parent_id:
+            parent = store.get_node(current_parent_id)
+            if parent is None:
+                break
+            for entry in self._collect_merged_child_context(
+                parent.node_id,
+                available_before=node.created_at,
+                availability_label="merged upstream",
+            ):
+                owner_node_id = entry["owner_node_id"]
+                if owner_node_id == node.node_id or owner_node_id in seen:
+                    continue
+                seen.add(owner_node_id)
+                entries.append(entry)
+            current_parent_id = parent.parent_id
+
+        return entries
+
+    def _build_planner_context(
+        self,
+        node,
+    ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+        worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
+        snapshot_summary = self._summarize_worktree_snapshot(worktree)
+
+        ownership_context: list[dict[str, Any]] = []
+        seen_owner_ids: set[str] = set()
+        for source in (
+            self._collect_parent_ownership_context(node),
+            self._collect_upstream_ownership_context(node),
+        ):
+            for entry in source:
+                owner_node_id = entry["owner_node_id"]
+                if owner_node_id in seen_owner_ids:
+                    continue
+                seen_owner_ids.add(owner_node_id)
+                ownership_context.append(entry)
+
+        merged_work = self._collect_merged_child_context(
+            node.node_id,
+            availability_label="merged into this branch",
+        )
+        return snapshot_summary, ownership_context, merged_work
+
+    def _allow_pause(self, node, run) -> bool:
+        return bool(run and run.persistent and run.root_node_id == node.node_id)
+
+    def _build_manager_prompt(self, node, run) -> str:
+        store = self._ensure_store()
+        domains = store.get_domains(node.node_id)
+        snapshot_summary, ownership_context, merged_work = self._build_planner_context(node)
+        merged_child_ids = {entry["owner_node_id"] for entry in merged_work}
+
+        events = store.get_node_events(node.node_id)
+        user_input = node.task_spec
+        for evt in reversed(events):
+            if evt.event_type == "user_input":
+                user_input = evt.data.get("input", node.task_spec)
+                break
+
+        domain_dicts = []
+        for d in domains:
+            child = store.get_node(d.child_node_id)
+            child_summary = self._summary_from_raw(self._latest_execution_raw(d.child_node_id))
+            domain_dicts.append({
+                "domain_name": d.domain_name,
+                "child_node_id": d.child_node_id,
+                "file_patterns": d.file_patterns,
+                "module_scope": d.module_scope,
+                "child_state": child.state.value if child else "unknown",
+                "last_summary": child_summary,
+                "availability": (
+                    "merged into current snapshot"
+                    if d.child_node_id in merged_child_ids
+                    else "owned by child; not available yet"
+                ),
+            })
+
+        return routing_prompt(
+            user_input,
+            domain_dicts,
+            run.pass_count,
+            snapshot_summary=snapshot_summary,
+            ownership_context=ownership_context,
+            merged_work=merged_work,
+            allow_pause=self._allow_pause(node, run),
+        )
+
+    @staticmethod
+    def _build_plan_retry_prompt(base_prompt: str, reason: str) -> str:
+        return (
+            f"{base_prompt}\n\n"
+            "The previous plan was invalid for this runtime.\n"
+            f"Reason: {reason}\n\n"
+            "Replan from the current snapshot. Produce only the next valid, "
+            "snapshot-independent wave."
+        )
+
+    @staticmethod
+    def _classify_wave_role(spec: ChildSpec) -> str:
+        text_parts = [spec.objective, spec.module_scope or ""]
+        if spec.file_patterns:
+            text_parts.extend(spec.file_patterns)
+        haystack = " ".join(text_parts).lower()
+        if any(marker in haystack for marker in FOUNDATION_WAVE_MARKERS):
+            return "foundation"
+        if any(marker in haystack for marker in FEATURE_WAVE_MARKERS):
+            return "feature"
+        return "neutral"
+
+    @staticmethod
+    def _child_mentions_dependency(spec: ChildSpec) -> bool:
+        text_parts = [spec.objective, spec.module_scope or ""]
+        if spec.file_patterns:
+            text_parts.extend(spec.file_patterns)
+        haystack = " ".join(text_parts).lower()
+        return any(marker in haystack for marker in DEPENDENCY_MARKERS)
+
+    def _validate_wave_children(self, children: list[ChildSpec]) -> str | None:
+        roles = {self._classify_wave_role(child) for child in children}
+        if "foundation" in roles and "feature" in roles:
+            return (
+                "This wave mixes prerequisite foundation work with dependent feature work. "
+                "Split it into multiple waves: foundation first, then feature work after merge."
+            )
+
+        for child in children:
+            if self._child_mentions_dependency(child):
+                return (
+                    "Child objectives must be independent against the current parent snapshot. "
+                    "Do not reference previous children, sibling work, or scaffold/setup from another child."
+                )
+        return None
+
+    @staticmethod
+    def _normalize_label(value: str | None) -> str:
+        if not value:
+            return ""
+        return " ".join(str(value).strip().lower().split())
+
+    @classmethod
+    def _pattern_prefixes(cls, patterns: list[str] | None) -> set[str]:
+        prefixes: set[str] = set()
+        for pattern in patterns or []:
+            normalized = str(pattern).strip().lower()
+            if not normalized:
+                continue
+            cut = len(normalized)
+            for marker in ("*", "?", "["):
+                index = normalized.find(marker)
+                if index != -1:
+                    cut = min(cut, index)
+            prefix = normalized[:cut].rstrip("/")
+            if prefix:
+                prefixes.add(prefix)
+        return prefixes
+
+    @classmethod
+    def _file_patterns_overlap(
+        cls,
+        left: list[str] | None,
+        right: list[str] | None,
+    ) -> bool:
+        left_prefixes = cls._pattern_prefixes(left)
+        right_prefixes = cls._pattern_prefixes(right)
+        if not left_prefixes or not right_prefixes:
+            return False
+        for left_prefix in left_prefixes:
+            for right_prefix in right_prefixes:
+                if (
+                    left_prefix == right_prefix
+                    or left_prefix.startswith(f"{right_prefix}/")
+                    or right_prefix.startswith(f"{left_prefix}/")
+                ):
+                    return True
+        return False
+
+    def _find_reusable_domain(self, parent_node_id: str, spec: ChildSpec):
+        store = self._ensure_store()
+        spec_domain = self._normalize_label(spec.domain_name)
+        spec_scope = self._normalize_label(spec.module_scope)
+        for domain in store.get_domains(parent_node_id):
+            domain_name_match = spec_domain and spec_domain == self._normalize_label(domain.domain_name)
+            scope_match = spec_scope and spec_scope == self._normalize_label(domain.module_scope)
+            file_match = self._file_patterns_overlap(spec.file_patterns, domain.file_patterns)
+            if not (domain_name_match or scope_match or file_match):
+                continue
+            return domain, store.get_node(domain.child_node_id)
+        return None
+
+    def _validate_domain_reuse(self, node, children: list[ChildSpec]) -> str | None:
+        for child in children:
+            match = self._find_reusable_domain(node.node_id, child)
+            if match is None:
+                continue
+            domain, owner = match
+            owner_id = owner.node_id[:12] if owner else domain.child_node_id[:12]
+            return (
+                f"The proposed child '{child.objective}' belongs to existing domain "
+                f"'{domain.domain_name}' owned by child {owner_id}. Route dependent "
+                "follow-up back to that child instead of spawning a second child for the same domain."
+            )
+        return None
+
+    def _validate_routes(self, node, routes: list[RouteSpec] | None) -> str | None:
+        if not routes:
+            return None
+
+        store = self._ensure_store()
+        direct_children = {child.node_id for child in store.get_children(node.node_id)}
+        seen_targets: set[str] = set()
+
+        for route in routes:
+            if route.child_node_id not in direct_children:
+                return "Routes must target an existing direct child of the current manager."
+            if route.child_node_id in seen_targets:
+                return (
+                    "A single wave may route at most one task to each child. Combine follow-up work "
+                    "for that child into one task, then loop again if more dependent work remains."
+                )
+            seen_targets.add(route.child_node_id)
+
+            domain = store.get_domain_by_child(route.child_node_id)
+            if domain and route.domain_name:
+                if self._normalize_label(route.domain_name) != self._normalize_label(domain.domain_name):
+                    return (
+                        f"Route target {route.child_node_id[:12]} owns domain '{domain.domain_name}', "
+                        f"not '{route.domain_name}'. Route follow-up to the correct owner."
+                    )
+        return None
+
+    def _validate_plan_decision(self, node, run, decision: PlanDecision) -> str | None:
+        if self._allow_pause(node, run) and decision.action == "done":
+            decision.action = "pause"
+
+        if self._ensure_store().get_children(node.node_id) and decision.action == "solve_directly":
+            return "Nodes that have delegated work must remain manager-only and cannot execute directly."
+
+        route_error = self._validate_routes(node, decision.routes)
+        if route_error:
+            return route_error
+
+        if decision.children:
+            domain_reuse_error = self._validate_domain_reuse(node, decision.children)
+            if domain_reuse_error:
+                return domain_reuse_error
+            return self._validate_wave_children(decision.children)
+
+        return None
+
+    def _should_continue_planning_after_merge(self, node_id: str) -> bool:
+        store = self._ensure_store()
+        for event in reversed(store.get_node_events(node_id)):
+            if event.event_type != "state_transition":
+                continue
+            if event.data.get("to") != NodeState.WAITING_ON_CHILDREN.value:
+                continue
+            if event.data.get("action") not in ("spawn_children", "route_to_children"):
+                continue
+            return bool(event.data.get("more_waves_expected"))
+        return False
 
     # --- Run lifecycle ---
 
@@ -120,6 +716,13 @@ class Orchestrator:
         store.set_root_node(run.run_id, root.node_id)
         self._root_node_id = root.node_id
         log.info("Created root node %s at %s", root.node_id, wt_path)
+        self._emit_status({
+            "event": "run_created",
+            "run_id": run.run_id,
+            "root_node_id": root.node_id,
+            "task_spec": task,
+        })
+        self._emit_node_status(root.node_id, event="node_created")
 
         await self._drive_root(run.run_id, root.node_id, persistent)
         return run.run_id
@@ -239,7 +842,16 @@ class Orchestrator:
             else:
                 break
 
-            if fsm.node.state == prev_state:
+            current_state = fsm.node.state
+            if current_state != prev_state:
+                self._emit_node_status(
+                    node_id,
+                    event="state_changed",
+                    previous_state=prev_state.value,
+                )
+                continue
+
+            if current_state == prev_state:
                 log.warning("Node %s stuck in %s, breaking", node_id, prev_state.value)
                 break
 
@@ -254,84 +866,87 @@ class Orchestrator:
         # Check if this is a verification retry (re-planning after test failure)
         is_verify_retry = self._is_verification_retry(node)
 
-        # Check if this is a routing pass (multi-pass follow-up on root or parent)
-        is_routing = run and run.pass_count > 1 and len(store.get_children(node.node_id)) > 0
+        # Existing children mean this node is a manager replanning from an updated snapshot.
+        is_manager = len(store.get_children(node.node_id)) > 0
 
         if is_verify_retry:
             prompt = self._build_verify_retry_prompt(node, run)
-        elif is_routing:
-            prompt = self._build_routing_prompt(node, run)
+        elif is_manager:
+            prompt = self._build_manager_prompt(node, run)
         else:
-            prompt = planning_prompt(node.task_spec)
-
-        try:
-            result = await self.adapter.run(
-                prompt=prompt, worktree=worktree, mode="plan",
-                resume_session_id=node.session_id if (is_routing or is_verify_retry) else None,
-                on_message=self._stream_callback_for(node.node_id),
-                is_root=self._is_root(node.node_id),
+            snapshot_summary, ownership_context, _ = self._build_planner_context(node)
+            domain = store.get_domain_by_child(node.node_id)
+            prompt = planning_prompt(
+                node.task_spec,
+                file_scope=domain.file_patterns if domain else None,
+                snapshot_summary=snapshot_summary,
+                ownership_context=ownership_context,
+                allow_pause=self._allow_pause(node, run),
             )
-        except Exception as e:
-            log.error("Planning failed for %s: %s", node.node_id, e)
-            fsm.fail(str(e), failure_type="adapter_error")
-            return
 
-        previous_session_id = node.session_id
-        store.update_node(node.node_id, session_id=result.session_id)
-        if result.session_id != previous_session_id or not store.session_exists(result.session_id):
-            store.create_session(result.session_id, node.node_id, self.adapter.name)
-        store.finish_session(result.session_id)
+        resume_session_id = node.session_id if (is_manager or is_verify_retry) else None
+        max_attempts = 3
 
-        store.append_event(node.run_id, node.node_id, "plan_result", {
-            "session_id": result.session_id,
-            "raw": result.raw,
-            "cost": _cost_to_dict(result.cost),
-        })
+        for attempt in range(max_attempts):
+            try:
+                result = await self.adapter.run(
+                    prompt=prompt,
+                    worktree=worktree,
+                    mode="plan",
+                    resume_session_id=resume_session_id,
+                    on_message=self._stream_callback_for(node.node_id),
+                    is_root=self._is_root(node.node_id),
+                )
+            except Exception as e:
+                log.error("Planning failed for %s: %s", node.node_id, e)
+                fsm.fail(str(e), failure_type="adapter_error")
+                return
 
-        decision = self._parse_plan_decision(result.raw)
-        log.info("Node %s plan: %s (%s)", node.node_id, decision.action, decision.rationale[:80])
+            previous_session_id = node.session_id
+            store.update_node(node.node_id, session_id=result.session_id)
+            if result.session_id != previous_session_id or not store.session_exists(result.session_id):
+                store.create_session(result.session_id, node.node_id, self.adapter.name)
+            store.finish_session(result.session_id)
 
-        # Handle routing: reactivate existing children
-        if decision.action == "route_to_children" and decision.routes:
-            for route in decision.routes:
-                self._prepare_child_reactivation(node, route)
-
-        fsm.apply_plan_decision(decision)
-
-    def _build_routing_prompt(self, node, run) -> str:
-        """Build the routing prompt with domain registry for multi-pass."""
-        store = self._ensure_store()
-        domains = store.get_domains(node.node_id)
-
-        # Get the latest user input
-        events = store.get_node_events(node.node_id)
-        user_input = node.task_spec
-        for evt in reversed(events):
-            if evt.event_type == "user_input":
-                user_input = evt.data.get("input", node.task_spec)
-                break
-
-        # Enrich domains with child state and last summary
-        domain_dicts = []
-        for d in domains:
-            child = store.get_node(d.child_node_id)
-            child_summary = ""
-            if child:
-                child_events = store.get_node_events(child.node_id)
-                for evt in reversed(child_events):
-                    if evt.event_type == "execution_result":
-                        child_summary = evt.data.get("raw", {}).get("summary", "")
-                        break
-            domain_dicts.append({
-                "domain_name": d.domain_name,
-                "child_node_id": d.child_node_id,
-                "file_patterns": d.file_patterns,
-                "module_scope": d.module_scope,
-                "child_state": child.state.value if child else "unknown",
-                "last_summary": child_summary,
+            store.append_event(node.run_id, node.node_id, "plan_result", {
+                "session_id": result.session_id,
+                "raw": result.raw,
+                "cost": _cost_to_dict(result.cost),
             })
 
-        return routing_prompt(user_input, domain_dicts, run.pass_count)
+            existing_child_ids = {
+                child.node_id for child in store.get_children(node.node_id)
+            }
+
+            decision = self._parse_plan_decision(result.raw)
+            log.info("Node %s plan: %s (%s)", node.node_id, decision.action, decision.rationale[:80])
+
+            invalid_reason = self._validate_plan_decision(node, run, decision)
+            if invalid_reason:
+                store.append_event(node.run_id, node.node_id, "plan_invalid", {
+                    "reason": invalid_reason,
+                    "raw": result.raw,
+                    "attempt": attempt + 1,
+                })
+                if attempt == max_attempts - 1:
+                    fsm.fail(invalid_reason, failure_type="invalid_plan")
+                    return
+                prompt = self._build_plan_retry_prompt(prompt, invalid_reason)
+                resume_session_id = result.session_id
+                continue
+
+            # Handle routing: reactivate existing children
+            if decision.action == "route_to_children" and decision.routes:
+                for route in decision.routes:
+                    self._prepare_child_reactivation(node, route)
+
+            fsm.apply_plan_decision(decision)
+
+            if decision.children:
+                for child in store.get_children(node.node_id):
+                    if child.node_id not in existing_child_ids:
+                        self._emit_node_status(child.node_id, event="node_created")
+            return
 
     def _prepare_child_reactivation(self, parent_node, route: RouteSpec) -> None:
         """Prepare a child for reactivation with a new task."""
@@ -341,18 +956,18 @@ class Orchestrator:
             log.warning("Route target %s not found", route.child_node_id)
             return
 
-        # Get the child's previous summary
-        child_events = store.get_node_events(child.node_id)
-        prev_summary = ""
-        for evt in reversed(child_events):
-            if evt.event_type == "execution_result":
-                prev_summary = evt.data.get("raw", {}).get("summary", "")
-                break
+        previous_raw = self._latest_execution_raw(child.node_id)
+        prev_summary = self._summary_from_raw(previous_raw)
+        prev_handoff = self._format_handoff_for_prompt(
+            self._handoff_from_raw(previous_raw),
+            fallback_summary=prev_summary,
+        )
 
         # Store the reactivation event (will be picked up by _run_execution)
         store.append_event(child.run_id, child.node_id, "reactivation_requested", {
             "new_task": route.task_spec,
             "previous_summary": prev_summary,
+            "previous_handoff": prev_handoff,
             "original_task": child.task_spec,
         })
 
@@ -362,6 +977,13 @@ class Orchestrator:
         node = fsm.node
         store = self._ensure_store()
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
+
+        if store.get_children(node.node_id):
+            fsm.fail(
+                "Nodes that have spawned children cannot execute directly; they must remain manager-only",
+                failure_type="invalid_state",
+            )
+            return
 
         events = store.get_node_events(node.node_id)
 
@@ -380,7 +1002,7 @@ class Orchestrator:
         if pending_event and pending_event.event_type == "reactivation_requested":
             prompt = reactivation_prompt(
                 original_task=pending_event.data.get("original_task", node.task_spec),
-                previous_summary=pending_event.data.get("previous_summary", ""),
+                previous_handoff=pending_event.data.get("previous_handoff", ""),
                 new_task=pending_event.data.get("new_task", ""),
             )
             resume_id = node.session_id
@@ -596,12 +1218,9 @@ class Orchestrator:
             base_sha = _merge_base(parent_wt, get_head_sha(parent_wt), get_head_sha(child_wt))
             diff_base = base_sha or "HEAD~1"
 
-            child_events = store.get_node_events(child.node_id)
-            child_summary = ""
-            for evt in reversed(child_events):
-                if evt.event_type == "execution_result":
-                    child_summary = evt.data.get("raw", {}).get("summary", "")
-                    break
+            child_raw = self._latest_execution_raw(child.node_id)
+            child_summary = self._summary_from_raw(child_raw)
+            child_handoff = self._format_handoff_for_prompt(self._handoff_from_raw(child_raw))
 
             bundle = build_artifact_bundle(
                 node_id=child.node_id, worktree=child_wt,
@@ -614,6 +1233,7 @@ class Orchestrator:
                 child_id=child.node_id, diff=bundle.diff[:8000],
                 summary=bundle.summary or child_summary,
                 success_criteria=criteria,
+                handoff=child_handoff,
             )
 
             try:
@@ -675,7 +1295,9 @@ class Orchestrator:
         if not accepted_ids:
             log.warning("No accepted children for %s", node.node_id)
             final_sha = get_head_sha(parent_wt)
-            if run and run.persistent:
+            if self._should_continue_planning_after_merge(node.node_id):
+                fsm.continue_planning_after_merge(final_sha)
+            elif run and run.persistent:
                 fsm.pause_after_merge(final_sha)
             else:
                 fsm.finish_merge(final_sha)
@@ -757,10 +1379,19 @@ class Orchestrator:
                 })
 
         final_sha = get_head_sha(parent_wt)
+        continue_planning = self._should_continue_planning_after_merge(node.node_id)
         # Only the root node pauses in persistent mode — children always complete
         is_root = run and run.root_node_id == node.node_id
         should_verify = self._should_verify(node, run)
-        if is_root and run.persistent:
+        if continue_planning:
+            fsm.continue_planning_after_merge(final_sha, verify=should_verify)
+            log.info(
+                "Node %s merged wave at %s and will %s",
+                node.node_id,
+                final_sha[:8],
+                "verify before replanning" if should_verify else "replan",
+            )
+        elif is_root and run.persistent:
             fsm.pause_after_merge(final_sha, verify=should_verify)
             log.info("Node %s merged and %s at %s", node.node_id,
                      "verifying" if should_verify else "paused", final_sha[:8])
@@ -866,7 +1497,10 @@ class Orchestrator:
             log.info("Node %s: no test command, skipping verification", node.node_id)
             is_root = run and run.root_node_id == node.node_id
             persistent_root = is_root and run.persistent if run else False
-            fsm.finish_verify_pass(persistent_root=persistent_root)
+            fsm.finish_verify_pass(
+                persistent_root=persistent_root,
+                continue_planning=self._should_continue_planning_after_merge(node.node_id),
+            )
             return
 
         worktree = Path(node.worktree_path) if node.worktree_path else self.config.repo_root
@@ -903,7 +1537,10 @@ class Orchestrator:
             log.info("Node %s: verification PASSED (attempt %d)", node.node_id, verify_count + 1)
             is_root = run.root_node_id == node.node_id
             persistent_root = is_root and run.persistent
-            fsm.finish_verify_pass(persistent_root=persistent_root)
+            fsm.finish_verify_pass(
+                persistent_root=persistent_root,
+                continue_planning=self._should_continue_planning_after_merge(node.node_id),
+            )
         else:
             retries_remaining = self.config.max_verify_retries - (verify_count + 1)
             log.info(
@@ -1003,6 +1640,7 @@ class Orchestrator:
         return PlanDecision(
             action=raw.get("action", "solve_directly"),
             rationale=raw.get("rationale", ""),
+            more_waves_expected=bool(raw.get("more_waves_expected", False)),
             children=children,
             routes=routes,
             file_scope=raw.get("file_scope"),
@@ -1011,9 +1649,10 @@ class Orchestrator:
     def _parse_execution_result(self, raw: dict[str, Any]) -> ExecutionResult:
         return ExecutionResult(
             status=raw.get("status", "implemented"),
-            summary=raw.get("summary", ""),
+            summary=self._summary_from_raw(raw),
             changed_files=raw.get("changed_files"),
             commit_sha=raw.get("result_commit_sha") or raw.get("commit_sha"),
+            handoff=self._handoff_from_raw(raw),
         )
 
     def _parse_review_verdict(self, raw: dict[str, Any], child_id: str) -> ReviewVerdict:

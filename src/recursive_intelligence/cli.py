@@ -144,6 +144,8 @@ class StreamRenderer:
                 self._render_tool_use(data.get("tool", ""), data.get("input", {}))
             elif msg_type == "tool_result":
                 self._render_tool_result(data.get("content", ""))
+            elif msg_type == "status":
+                self._render_status(data)
 
     def _write(self, text: str) -> None:
         sys.stderr.write(text)
@@ -194,6 +196,52 @@ class StreamRenderer:
             preview += f" {DIM}(+{len(lines)-1} lines){RESET}"
         self._write(f"{INDENT}  {DIM}{preview}{RESET}\n")
 
+    def _render_status(self, data: dict[str, Any]) -> None:
+        self._end_text()
+
+        event = data.get("event", "")
+        node_id = str(data.get("node_id", ""))[:10]
+        parent_id = data.get("parent_id")
+        state = str(data.get("state", ""))
+        domain = data.get("domain")
+        task = str(data.get("task_spec", "")).strip().replace("\n", " ")
+        if len(task) > 60:
+            task = f"{task[:57]}..."
+
+        domain_tag = f" {_magenta(f'[{domain}]')}" if domain else ""
+
+        if event == "node_created":
+            role = "root" if not parent_id else "child"
+            line = f"{INDENT}{DIM}◦ {role} {node_id}{RESET}{domain_tag}"
+            if task:
+                line += f" {DIM}{task}{RESET}"
+            self._write(f"{line}\n")
+            return
+
+        if event != "state_changed":
+            return
+
+        show_line = bool(parent_id) or state in {
+            "waiting_on_children",
+            "reviewing_children",
+            "merging",
+            "paused",
+            "completed",
+            "failed",
+        }
+        if not show_line:
+            return
+
+        role = "root" if not parent_id else "child"
+        line = f"{INDENT}{DIM}◦ {role} {node_id}{RESET}{domain_tag} {_s(state)}"
+        child_count = data.get("child_count")
+        if state == "waiting_on_children" and isinstance(child_count, int) and child_count:
+            label = "child" if child_count == 1 else "children"
+            line += f" {DIM}{child_count} {label}{RESET}"
+        if task:
+            line += f" {DIM}{task}{RESET}"
+        self._write(f"{line}\n")
+
     def _summarize_tool_input(self, tool: str, inp: dict) -> str:
         if tool in ("Read", "Glob", "Grep"):
             path = inp.get("file_path") or inp.get("path") or inp.get("pattern") or ""
@@ -226,12 +274,19 @@ class BackgroundRunner:
         self._lock = threading.Lock()
         self.renderer = StreamRenderer()
 
+    def _on_message(self, msg_type: str, data: dict[str, Any]) -> None:
+        if msg_type == "status" and data.get("event") == "run_created":
+            run_id = data.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                self.run_id = run_id
+        self.renderer.on_message(msg_type, data)
+
     @property
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def start_run(self, task: str) -> None:
-        self.orchestrator._on_message = self.renderer.on_message
+        self.orchestrator._on_message = self._on_message
 
         def _work():
             try:
@@ -250,7 +305,7 @@ class BackgroundRunner:
     def continue_run(self, user_input: str) -> None:
         if self.run_id is None:
             return
-        self.orchestrator._on_message = self.renderer.on_message
+        self.orchestrator._on_message = self._on_message
 
         def _work():
             try:

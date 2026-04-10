@@ -8,6 +8,7 @@ from recursive_intelligence.runtime.node_fsm import (
     NodeFSM,
     PlanDecision,
     ReviewVerdict,
+    WorkerHandoff,
     child_spawn_dedupe_key,
     task_hash_short,
 )
@@ -70,6 +71,26 @@ class TestPlanDecisions:
         children = store.get_children(node.node_id)
         assert len(children) == 1
 
+    def test_spawn_children_records_wave_continuation_flag(self, store, run_and_node):
+        _, node = run_and_node
+        fsm = NodeFSM(store, node.node_id)
+        fsm.start_planning()
+
+        decision = PlanDecision(
+            action="spawn_children",
+            rationale="foundation wave first",
+            more_waves_expected=True,
+            children=[ChildSpec("slot-0", "scaffold app shell", ["shell exists"])],
+        )
+        fsm.apply_plan_decision(decision)
+
+        transition = [
+            event for event in store.get_node_events(node.node_id)
+            if event.event_type == "state_transition"
+        ][-1]
+        assert transition.event_type == "state_transition"
+        assert transition.data["more_waves_expected"] is True
+
 
 class TestExecution:
     def test_successful_execution(self, store, run_and_node):
@@ -86,6 +107,29 @@ class TestExecution:
         )
         fsm.finish_execution(result)
         assert fsm.node.state == NodeState.COMPLETED
+
+    def test_execution_persists_structured_handoff(self, store, run_and_node):
+        _, node = run_and_node
+        fsm = NodeFSM(store, node.node_id)
+        fsm.start_planning()
+        fsm.apply_plan_decision(PlanDecision(action="solve_directly"))
+
+        result = ExecutionResult(
+            status="implemented",
+            summary="Implemented the feature",
+            handoff=WorkerHandoff(
+                deliverables=["feature X shipped"],
+                concerns=["missing edge-case coverage"],
+                suggested_next_steps=["add regression tests"],
+            ),
+        )
+        fsm.finish_execution(result)
+
+        events = store.get_node_events(node.node_id)
+        transition = events[-1]
+        assert transition.event_type == "state_transition"
+        assert transition.data["handoff"]["deliverables"] == ["feature X shipped"]
+        assert transition.data["handoff"]["concerns"] == ["missing edge-case coverage"]
 
 
 class TestReview:

@@ -35,7 +35,12 @@ class ScriptedAdapter(AgentAdapter):
             raise RuntimeError("ScriptedAdapter ran out of responses")
 
         resp = self._responses.pop(0)
-        self._call_log.append({"prompt": prompt[:100], "mode": mode, "worktree": str(worktree)})
+        self._call_log.append({
+            "prompt": prompt[:100],
+            "full_prompt": prompt,
+            "mode": mode,
+            "worktree": str(worktree),
+        })
 
         # Optionally make a commit in the worktree
         if resp.get("_commit"):
@@ -211,6 +216,130 @@ class TestRecursiveFlow:
         assert modes == ["plan", "plan", "execute", "plan", "execute", "review", "review"]
 
     @pytest.mark.asyncio
+    async def test_staged_waves_replan_after_foundation_merge(self, config):
+        adapter = ScriptedAdapter([
+            # Wave 1: foundation only, then replan from merged snapshot.
+            {"action": "spawn_children", "rationale": "lay foundation first", "more_waves_expected": True,
+             "children": [
+                 {"idempotency_key": "foundation", "objective": "scaffold shared app shell",
+                  "success_criteria": ["shell exists"],
+                  "domain_name": "foundation", "file_patterns": ["app_shell.py"],
+                  "module_scope": "Shared app shell and setup"},
+             ]},
+            {"action": "solve_directly", "rationale": "small scaffold task"},
+            {"status": "implemented", "summary": "scaffolded app shell",
+             "_commit": True, "_commit_file": "app_shell.py", "_commit_msg": "add shell"},
+            {"verdict": "accept", "reason": "foundation is good"},
+            # Wave 2: feature now that the shell exists in the parent snapshot.
+            {"action": "spawn_children", "rationale": "build feature on merged shell",
+             "children": [
+                 {"idempotency_key": "feature", "objective": "build dashboard feature",
+                  "success_criteria": ["dashboard works"],
+                  "domain_name": "dashboard", "file_patterns": ["dashboard.py"],
+                  "module_scope": "Dashboard feature"},
+             ]},
+            {"action": "solve_directly", "rationale": "feature is isolated now"},
+            {"status": "implemented", "summary": "built dashboard feature",
+             "_commit": True, "_commit_file": "dashboard.py", "_commit_msg": "add dashboard"},
+            {"verdict": "accept", "reason": "feature is good"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build the app shell and dashboard")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        children = store.get_children(root.node_id)
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(children) == 2
+
+        root_wt = Path(root.worktree_path)
+        assert (root_wt / "app_shell.py").exists()
+        assert (root_wt / "dashboard.py").exists()
+
+        plan_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_result"
+        ]
+        assert len(plan_events) == 2
+        assert plan_events[0].data["raw"]["more_waves_expected"] is True
+        assert "scaffold" in plan_events[0].data["raw"]["children"][0]["objective"]
+        store.close()
+
+        modes = [c["mode"] for c in adapter.calls]
+        assert modes == ["plan", "plan", "execute", "review", "plan", "plan", "execute", "review"]
+        root_second_plan_prompt = adapter.calls[4]["full_prompt"]
+        feature_child_plan_prompt = adapter.calls[5]["full_prompt"]
+        assert "Current Snapshot" in root_second_plan_prompt
+        assert "Previously Merged Child Work In This Branch" in root_second_plan_prompt
+        assert "foundation" in root_second_plan_prompt
+        assert "merged into this branch" in root_second_plan_prompt
+        assert "Nearby Ownership And Availability" in feature_child_plan_prompt
+        assert "foundation" in feature_child_plan_prompt
+        assert "merged into current snapshot" in feature_child_plan_prompt
+
+    @pytest.mark.asyncio
+    async def test_invalid_mixed_wave_is_replanned(self, config):
+        adapter = ScriptedAdapter([
+            # Invalid: mixes scaffold and feature work in the same wave.
+            {"action": "spawn_children", "rationale": "do everything at once",
+             "children": [
+                 {"idempotency_key": "foundation", "objective": "scaffold workspace",
+                  "success_criteria": ["workspace exists"],
+                  "domain_name": "foundation", "file_patterns": ["workspace.py"],
+                  "module_scope": "Workspace bootstrap"},
+                 {"idempotency_key": "feature", "objective": "build dashboard page",
+                  "success_criteria": ["dashboard works"],
+                  "domain_name": "dashboard", "file_patterns": ["dashboard.py"],
+                  "module_scope": "Dashboard page"},
+             ]},
+            # Retry plan: foundation wave only, then another wave later.
+            {"action": "spawn_children", "rationale": "foundation first", "more_waves_expected": True,
+             "children": [
+                 {"idempotency_key": "foundation", "objective": "scaffold workspace",
+                  "success_criteria": ["workspace exists"],
+                  "domain_name": "foundation", "file_patterns": ["workspace.py"],
+                  "module_scope": "Workspace bootstrap"},
+             ]},
+            {"action": "solve_directly", "rationale": "bootstrap only"},
+            {"status": "implemented", "summary": "workspace scaffolded",
+             "_commit": True, "_commit_file": "workspace.py", "_commit_msg": "workspace"},
+            {"verdict": "accept", "reason": "foundation accepted"},
+            # Follow-up wave after merge.
+            {"action": "spawn_children", "rationale": "now build dashboard",
+             "children": [
+                 {"idempotency_key": "feature", "objective": "build dashboard page",
+                  "success_criteria": ["dashboard works"],
+                  "domain_name": "dashboard", "file_patterns": ["dashboard.py"],
+                  "module_scope": "Dashboard page"},
+             ]},
+            {"action": "solve_directly", "rationale": "dashboard only"},
+            {"status": "implemented", "summary": "dashboard built",
+             "_commit": True, "_commit_file": "dashboard.py", "_commit_msg": "dashboard"},
+            {"verdict": "accept", "reason": "dashboard accepted"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build workspace and dashboard")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(invalid_events) == 1
+        assert "multiple waves" in invalid_events[0].data["reason"]
+        store.close()
+
+    @pytest.mark.asyncio
     async def test_verification_runs_once_after_root_merge(self, git_repo):
         config = RuntimeConfig(repo_root=git_repo, max_parallel_children=1)
         adapter = ScriptedAdapter([
@@ -284,6 +413,71 @@ class TestRecursiveFlow:
         assert len(root["children"]) == 1
         assert root["children"][0]["state"] == "completed"
         store.close()
+
+    @pytest.mark.asyncio
+    async def test_emits_status_updates_for_spawned_children(self, config):
+        events: list[tuple[str, dict]] = []
+
+        adapter = ScriptedAdapter([
+            {"action": "spawn_children", "rationale": "split",
+             "children": [
+                 {"idempotency_key": "child-a", "objective": "implement feature A",
+                  "success_criteria": ["A works"]},
+                 {"idempotency_key": "child-b", "objective": "implement feature B",
+                  "success_criteria": ["B works"]},
+             ]},
+            {"action": "solve_directly", "rationale": "simple"},
+            {"status": "implemented", "summary": "added A",
+             "_commit": True, "_commit_file": "feature_a.txt", "_commit_msg": "add feature A"},
+            {"action": "solve_directly", "rationale": "simple"},
+            {"status": "implemented", "summary": "added B",
+             "_commit": True, "_commit_file": "feature_b.txt", "_commit_msg": "add feature B"},
+            {"verdict": "accept", "reason": "looks good"},
+            {"verdict": "accept", "reason": "looks good"},
+        ])
+
+        orch = Orchestrator(config, adapter, on_message=lambda msg_type, data: events.append((msg_type, data)))
+        run_id = await orch.start_run("build features A and B")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        children = store.get_children(root.node_id)
+        child_ids = {child.node_id for child in children}
+        store.close()
+
+        status_events = [data for msg_type, data in events if msg_type == "status"]
+
+        assert any(
+            e["event"] == "run_created"
+            and e["run_id"] == run_id
+            and e["root_node_id"] == root.node_id
+            for e in status_events
+        )
+        assert any(
+            e["event"] == "node_created"
+            and e["node_id"] == root.node_id
+            and e["parent_id"] is None
+            for e in status_events
+        )
+        assert len([e for e in status_events if e["event"] == "node_created" and e["node_id"] in child_ids]) == 2
+        assert any(
+            e["event"] == "state_changed"
+            and e["node_id"] == root.node_id
+            and e["state"] == "waiting_on_children"
+            and e["child_count"] == 2
+            for e in status_events
+        )
+        assert child_ids <= {
+            e["node_id"]
+            for e in status_events
+            if e["event"] == "state_changed" and e["state"] == "planning"
+        }
+        assert child_ids <= {
+            e["node_id"]
+            for e in status_events
+            if e["event"] == "state_changed" and e["state"] == "completed"
+        }
 
 
 class TestReviseLoop:
