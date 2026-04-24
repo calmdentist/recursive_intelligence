@@ -130,6 +130,7 @@ If another node owns a needed scope but it is not available yet, plan around tha
 constraint instead of rebuilding it.
 If follow-up work belongs to a domain that is already owned nearby, keep that work with
 the existing owner instead of spawning a second child for the same domain.
+Base the decision on your actual context needs: if the work still fits clearly in one node, do it yourself.
 
 ## Respond with ONE of:
 
