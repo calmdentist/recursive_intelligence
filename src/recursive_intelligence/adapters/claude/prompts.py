@@ -7,8 +7,14 @@ from typing import Any
 SYSTEM_CONTRACT = """\
 You are a node in a recursive coding-agent runtime. You work in an isolated git worktree.
 
-- Solve small tasks directly. Decompose large tasks into children with independent file scopes.
-- Commit your work before finishing.
+- During planning, only inspect the repo and decide what to do next. Do not edit files, install packages, or create commits.
+- Prefer direct execution when you can complete the task reliably after a brief repo exploration.
+- Delegate only when parallelism or context reduction clearly helps.
+- Parallel children should own substantial, mostly disjoint domains rather than tiny tasks.
+- Same-wave children must be runnable from the same parent snapshot and must not depend on sibling output.
+- Route follow-up work back to the existing domain owner instead of spawning duplicate children.
+- Stop recursing when another layer would add orchestration overhead more than clarity or throughput.
+- Commit your work before finishing any execution or revision phase.
 - End each phase with a single JSON object. No wrapping text or markdown around it.
 """
 
@@ -20,15 +26,30 @@ the human sees directly in the UI.
 - Keep your streamed messages conversational and plain-English.
 - Do not expose raw JSON envelopes, tool chatter, or internal control-plane jargon to the human.
 - Give short progress updates before or between major steps when useful.
-- Commit work before finishing.
+- During planning, only inspect the repo and decide what to do next. Do not edit files, install packages, or create commits.
+- Apply the same delegation rules as other nodes: parallelize only across substantial, mostly disjoint domains.
+- Prefer a small number of meaningful children over many tiny ones.
+- Commit work before finishing any execution or revision phase.
 - End each phase with a single JSON object. No wrapping text or markdown around it.
 """
 
 
-def _completion_option(allow_pause: bool) -> str:
+DECOMPOSITION_POLICY = """\
+## Decomposition Policy
+- Solve directly if you can comfortably understand and complete the work within your own context after exploring the repo.
+- Delegate only when there are multiple substantial, mostly disjoint domains that can advance in parallel, or when a prerequisite wave must land first.
+- Prefer a small number of meaningful children. Avoid many tiny children, single-file micro-tasks, or splits that only separate tightly coupled layers of one feature.
+- Children should own outcomes or domains, not implementation fragments.
+- Same-wave children must be independent against the current parent snapshot. If child B would need child A's output, do not make them siblings in the same live wave.
+- If follow-up work stays inside an existing child domain, keep it with that child.
+- Stop decomposing when the next node could reasonably execute the work end-to-end without needing another management layer.
+"""
+
+
+def _pause_option(allow_pause: bool) -> str:
     if allow_pause:
         return 'Pause and wait for more instructions:\n{"action": "pause", "rationale": "..."}'
-    return 'Done:\n{"action": "done", "rationale": "..."}'
+    return ""
 
 
 def _bullet_section(title: str, lines: list[str] | None, empty_message: str) -> str:
@@ -71,7 +92,7 @@ def planning_prompt(
     scope = ""
     if file_scope:
         scope = f"\nRelevant files: {', '.join(file_scope)}"
-    completion = _completion_option(allow_pause)
+    completion = _pause_option(allow_pause)
     snapshot_block = _bullet_section(
         "Current Snapshot",
         snapshot_summary,
@@ -92,6 +113,11 @@ Plan how to accomplish this task. Explore the repo first.
 
 ## Task
 {task_spec}
+
+{DECOMPOSITION_POLICY}
+
+This phase is decision-only. Do not implement code, edit files, install dependencies,
+or create commits while planning.
 
 Decompose work into snapshot-independent waves, not just non-overlapping file scopes.
 A valid wave contains tasks that each child can complete using only the CURRENT parent
@@ -236,7 +262,7 @@ def routing_prompt(
         for d in domains:
             patterns = ", ".join(d.get("file_patterns", []))
             rows.append(
-                f"| {d['domain_name']} | {d['child_node_id'][:12]} | {d.get('availability', '?')} | "
+                f"| {d['domain_name']} | {d['child_node_id']} | {d.get('availability', '?')} | "
                 f"{patterns} | {d.get('child_state', '?')} | {d.get('last_summary', '')[:50]} |"
             )
         domain_table = (
@@ -246,7 +272,7 @@ def routing_prompt(
         )
     else:
         domain_table = "(no children yet)"
-    completion = _completion_option(allow_pause)
+    completion = _pause_option(allow_pause)
     snapshot_block = _bullet_section(
         "Current Snapshot",
         snapshot_summary,
@@ -278,6 +304,7 @@ def routing_prompt(
 {user_input}
 
 You are a manager node with existing child domains. Do not implement code yourself.
+This phase is decision-only. Do not edit files, install dependencies, or create commits.
 Previously accepted child work is already merged into your current worktree. New child
 tasks must be executable immediately against this snapshot. If a requested outcome depends
 on foundation that is not yet merged, spawn or route ONLY that prerequisite wave first.
@@ -286,6 +313,9 @@ Do not recreate domains that are already owned upstream or already merged here.
 If follow-up stays inside an existing child domain, route it back to that same child.
 Do not spawn a second child for dependent follow-up in the same domain.
 Route at most one task to each child in a single wave.
+Use the exact child_node_id values from the table when routing to existing children.
+Prefer the minimum number of child tasks needed to keep work parallel and domain-disjoint.
+Do not fan out into many small routes when one child can own the next meaningful step.
 
 ## Respond with ONE of:
 

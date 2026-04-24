@@ -84,7 +84,10 @@ VALID_TRANSITIONS: dict[NodeState, set[NodeState]] = {
         NodeState.COMPLETED,  # user says "done"
         NodeState.CANCELLED,
     },
-    NodeState.COMPLETED: {NodeState.EXECUTING},  # revise loop
+    NodeState.COMPLETED: {
+        NodeState.EXECUTING,  # leaf revise loop
+        NodeState.PLANNING,   # manager revise loop
+    },
     NodeState.FAILED: set(),
     NodeState.CANCELLED: set(),
 }
@@ -407,6 +410,18 @@ class StateStore:
     # --- Sessions ---
 
     def create_session(self, session_id: str, node_id: str, adapter: str) -> None:
+        existing = self._conn.execute(
+            "SELECT node_id, adapter FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["node_id"] != node_id or existing["adapter"] != adapter:
+                raise ValueError(
+                    f"Session {session_id} already belongs to node {existing['node_id']} "
+                    f"via adapter {existing['adapter']}"
+                )
+            return
+
         now = _now()
         self._conn.execute(
             "INSERT INTO sessions (session_id, node_id, adapter, started_at) VALUES (?, ?, ?, ?)",

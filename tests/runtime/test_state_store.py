@@ -115,14 +115,22 @@ class TestStateTransitions:
         with pytest.raises(ValueError, match="Invalid transition"):
             store.transition_node(node.node_id, NodeState.MERGING)
 
-    def test_terminal_states_block_transitions(self, store):
+    def test_completed_state_only_allows_revision_transitions(self, store):
+        run = store.create_run("/tmp/repo", "task")
+        node = store.create_node(run.run_id, "subtask")
+        store.transition_node(node.node_id, NodeState.PLANNING)
+        store.transition_node(node.node_id, NodeState.EXECUTING)
+        store.transition_node(node.node_id, NodeState.COMPLETED)
+        store.transition_node(node.node_id, NodeState.PLANNING)
+
+    def test_completed_state_blocks_unrelated_transitions(self, store):
         run = store.create_run("/tmp/repo", "task")
         node = store.create_node(run.run_id, "subtask")
         store.transition_node(node.node_id, NodeState.PLANNING)
         store.transition_node(node.node_id, NodeState.EXECUTING)
         store.transition_node(node.node_id, NodeState.COMPLETED)
         with pytest.raises(ValueError, match="Invalid transition"):
-            store.transition_node(node.node_id, NodeState.PLANNING)
+            store.transition_node(node.node_id, NodeState.MERGING)
 
     def test_full_direct_solve_path(self, store):
         run = store.create_run("/tmp/repo", "task")

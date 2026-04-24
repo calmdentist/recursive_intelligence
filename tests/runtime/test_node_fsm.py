@@ -174,6 +174,44 @@ class TestReview:
         fsm.apply_review_verdict(verdict)
         assert fsm.node.state == NodeState.WAITING_ON_CHILDREN
 
+    def test_mixed_accept_and_reject_fails_parent(self, store, run_and_node):
+        _, node = run_and_node
+        fsm = NodeFSM(store, node.node_id)
+        fsm.start_planning()
+
+        fsm.apply_plan_decision(PlanDecision(
+            action="spawn_children",
+            children=[
+                ChildSpec("slot-0", "subtask A", ["works"]),
+                ChildSpec("slot-1", "subtask B", ["works"]),
+            ],
+        ))
+
+        children = store.get_children(node.node_id)
+        for child in children:
+            store.transition_node(child.node_id, NodeState.PLANNING)
+            store.transition_node(child.node_id, NodeState.EXECUTING)
+            store.transition_node(child.node_id, NodeState.COMPLETED)
+
+        fsm.wake_for_review()
+        fsm.apply_review_verdict(ReviewVerdict(
+            child_id=children[0].node_id,
+            verdict="accept",
+            reason="A is good",
+        ))
+        assert fsm.node.state == NodeState.REVIEWING_CHILDREN
+
+        fsm.apply_review_verdict(ReviewVerdict(
+            child_id=children[1].node_id,
+            verdict="reject",
+            reason="B failed",
+        ))
+
+        assert fsm.node.state == NodeState.FAILED
+        transition = store.get_node_events(node.node_id)[-1]
+        assert transition.data["failure_type"] == "some_children_rejected"
+        assert children[1].node_id in transition.data["failure_reason"]
+
 
 class TestVerification:
     def test_execution_to_verify(self, store, run_and_node):

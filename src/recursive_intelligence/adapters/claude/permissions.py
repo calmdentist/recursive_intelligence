@@ -15,7 +15,7 @@ class ModeConfig:
 
 # Plan mode: read-only exploration
 PLAN_MODE = ModeConfig(
-    allowed_tools=["Read", "Glob", "Grep", "Bash"],
+    allowed_tools=["Read", "Glob", "Grep"],
     permission_mode="default",
 )
 
