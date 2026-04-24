@@ -104,7 +104,6 @@ DEPENDENCY_MARKERS = (
     "previous child",
     "sibling task",
     "other child",
-    "depends on",
     "after the scaffold",
 )
 
@@ -258,6 +257,53 @@ class Orchestrator:
         if result.returncode != 0:
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def _capture_worktree_state(self, worktree: Path) -> dict[str, Any]:
+        head: str | None = None
+        try:
+            head = get_head_sha(worktree)
+        except Exception:
+            pass
+
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+        )
+        status = []
+        if result.returncode == 0:
+            status = [line.rstrip() for line in result.stdout.splitlines() if line.strip()]
+        return {"head": head, "status": status}
+
+    def _planning_mutation_reason(
+        self,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> str | None:
+        changes: list[str] = []
+        before_head = before.get("head")
+        after_head = after.get("head")
+        before_status = before.get("status", [])
+        after_status = after.get("status", [])
+
+        if before_head != after_head:
+            before_label = before_head[:8] if before_head else "(unknown)"
+            after_label = after_head[:8] if after_head else "(unknown)"
+            changes.append(f"HEAD changed from {before_label} to {after_label}")
+
+        if before_status != after_status:
+            if after_status:
+                preview = "; ".join(
+                    self._truncate_text(line, limit=80) for line in after_status[:5]
+                )
+                changes.append(f"worktree became dirty ({preview})")
+            else:
+                changes.append("worktree status changed during planning")
+
+        if not changes:
+            return None
+        return "Planner mutated the repo during plan mode: " + "; ".join(changes)
 
     def _summarize_worktree_snapshot(self, worktree: Path) -> list[str]:
         lines: list[str] = []
@@ -478,10 +524,22 @@ class Orchestrator:
 
         events = store.get_node_events(node.node_id)
         user_input = node.task_spec
-        for evt in reversed(events):
-            if evt.event_type == "user_input":
-                user_input = evt.data.get("input", node.task_spec)
-                break
+        pending_event = self._latest_pending_work_event(node.node_id)
+        if pending_event and pending_event.event_type == "revision_requested":
+            user_input = (
+                "Revision requested by parent:\n"
+                f"{pending_event.data.get('follow_up', node.task_spec)}"
+            )
+        elif pending_event and pending_event.event_type == "reactivation_requested":
+            user_input = (
+                "Follow-up requested by parent:\n"
+                f"{pending_event.data.get('new_task', node.task_spec)}"
+            )
+        else:
+            for evt in reversed(events):
+                if evt.event_type == "user_input":
+                    user_input = evt.data.get("input", node.task_spec)
+                    break
 
         domain_dicts = []
         for d in domains:
@@ -655,8 +713,10 @@ class Orchestrator:
         return None
 
     def _validate_plan_decision(self, node, run, decision: PlanDecision) -> str | None:
-        if self._allow_pause(node, run) and decision.action == "done":
-            decision.action = "pause"
+        if decision.action == "done":
+            if self._allow_pause(node, run):
+                return "Planning cannot return done. Use pause to wait for more instructions."
+            return "Planning cannot return done. Use solve_directly to enter execution."
 
         if self._ensure_store().get_children(node.node_id) and decision.action == "solve_directly":
             return "Nodes that have delegated work must remain manager-only and cannot execute directly."
@@ -888,6 +948,7 @@ class Orchestrator:
         max_attempts = 3
 
         for attempt in range(max_attempts):
+            pre_plan_state = self._capture_worktree_state(worktree)
             try:
                 result = await self.adapter.run(
                     prompt=prompt,
@@ -902,7 +963,8 @@ class Orchestrator:
                 fsm.fail(str(e), failure_type="adapter_error")
                 return
 
-            previous_session_id = node.session_id
+            current_node = store.get_node(node.node_id)
+            previous_session_id = current_node.session_id if current_node else None
             store.update_node(node.node_id, session_id=result.session_id)
             if result.session_id != previous_session_id or not store.session_exists(result.session_id):
                 store.create_session(result.session_id, node.node_id, self.adapter.name)
@@ -913,6 +975,19 @@ class Orchestrator:
                 "raw": result.raw,
                 "cost": _cost_to_dict(result.cost),
             })
+
+            post_plan_state = self._capture_worktree_state(worktree)
+            mutation_reason = self._planning_mutation_reason(pre_plan_state, post_plan_state)
+            if mutation_reason:
+                store.append_event(node.run_id, node.node_id, "planner_mutated_repo", {
+                    "reason": mutation_reason,
+                    "before": pre_plan_state,
+                    "after": post_plan_state,
+                    "raw": result.raw,
+                })
+                log.error("Planning mutated repo for %s: %s", node.node_id, mutation_reason)
+                fsm.fail(mutation_reason, failure_type="planner_mutated_repo")
+                return
 
             existing_child_ids = {
                 child.node_id for child in store.get_children(node.node_id)
@@ -1068,13 +1143,23 @@ class Orchestrator:
         children_to_drive: list[str] = []
         for child in children:
             if child.state == NodeState.COMPLETED and self._has_pending_work(child):
-                log.info("Child %s has pending work, re-executing", child.node_id)
-                store.transition_node(child.node_id, NodeState.EXECUTING, {
+                target = (
+                    NodeState.PLANNING
+                    if store.get_children(child.node_id)
+                    else NodeState.EXECUTING
+                )
+                log.info("Child %s has pending work, driving %s", child.node_id, target.value)
+                store.transition_node(child.node_id, target, {
                     "reason": "reactivation_or_revision",
                 })
             elif child.state == NodeState.PAUSED and self._has_pending_work(child):
-                log.info("Child %s paused with pending work, re-executing", child.node_id)
-                store.transition_node(child.node_id, NodeState.EXECUTING, {
+                target = (
+                    NodeState.PLANNING
+                    if store.get_children(child.node_id)
+                    else NodeState.EXECUTING
+                )
+                log.info("Child %s paused with pending work, driving %s", child.node_id, target.value)
+                store.transition_node(child.node_id, target, {
                     "reason": "reactivation_or_revision",
                 })
             elif child.state.is_idle:
@@ -1131,18 +1216,30 @@ class Orchestrator:
 
         fsm.wake_for_review()
 
-    def _has_pending_work(self, child) -> bool:
-        """Check if a child has pending revision or reactivation."""
+    def _latest_pending_work_event(self, node_id: str):
         store = self._ensure_store()
-        events = store.get_node_events(child.node_id)
-        last_exec_idx = -1
+        events = store.get_node_events(node_id)
+        last_completion_idx = -1
         last_work_idx = -1
+        pending_event = None
         for i, e in enumerate(events):
             if e.event_type == "execution_result":
-                last_exec_idx = i
+                last_completion_idx = i
+            elif (
+                e.event_type == "state_transition"
+                and e.data.get("to") in (NodeState.COMPLETED.value, NodeState.PAUSED.value)
+            ):
+                last_completion_idx = i
             elif e.event_type in ("revision_requested", "reactivation_requested"):
                 last_work_idx = i
-        return last_work_idx > last_exec_idx
+                pending_event = e
+        if last_work_idx > last_completion_idx:
+            return pending_event
+        return None
+
+    def _has_pending_work(self, child) -> bool:
+        """Check if a child has pending revision or reactivation."""
+        return self._latest_pending_work_event(child.node_id) is not None
 
     # --- Review ---
 

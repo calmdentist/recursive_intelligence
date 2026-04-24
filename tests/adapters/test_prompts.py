@@ -1,5 +1,6 @@
 """Tests for planner and system prompt policy guidance."""
 
+from recursive_intelligence.adapters.claude.permissions import PLAN_MODE
 from recursive_intelligence.adapters.claude.prompts import (
     ROOT_SYSTEM_CONTRACT,
     SYSTEM_CONTRACT,
@@ -9,6 +10,7 @@ from recursive_intelligence.adapters.claude.prompts import (
 
 
 def test_system_contract_emphasizes_context_aware_delegation() -> None:
+    assert "During planning, only inspect the repo" in SYSTEM_CONTRACT
     assert "Prefer direct execution" in SYSTEM_CONTRACT
     assert "mostly disjoint domains" in SYSTEM_CONTRACT
     assert "must not depend on sibling output" in SYSTEM_CONTRACT
@@ -18,6 +20,7 @@ def test_system_contract_emphasizes_context_aware_delegation() -> None:
 def test_root_system_contract_keeps_parallelism_coarse_and_human_facing() -> None:
     assert "conversational and plain-English" in ROOT_SYSTEM_CONTRACT
     assert "small number of meaningful children" in ROOT_SYSTEM_CONTRACT
+    assert "During planning, only inspect the repo" in ROOT_SYSTEM_CONTRACT
 
 
 def test_planning_prompt_includes_decomposition_policy() -> None:
@@ -32,6 +35,8 @@ def test_planning_prompt_includes_decomposition_policy() -> None:
     assert "Prefer a small number of meaningful children" in prompt
     assert "Children should own outcomes or domains" in prompt
     assert "Base the decision on your actual context needs" in prompt
+    assert "This phase is decision-only." in prompt
+    assert '"action": "done"' not in prompt
 
 
 def test_routing_prompt_limits_over_parallelization() -> None:
@@ -54,4 +59,12 @@ def test_routing_prompt_limits_over_parallelization() -> None:
     assert "route it back to that same child" in prompt
     assert "Do not spawn a second child" in prompt
     assert "Route at most one task to each child in a single wave" in prompt
+    assert "Use the exact child_node_id values" in prompt
+    assert "node-auth" in prompt
     assert "Prefer the minimum number of child tasks needed" in prompt
+    assert "This phase is decision-only." in prompt
+    assert '"action": "done"' not in prompt
+
+
+def test_plan_mode_is_read_only() -> None:
+    assert PLAN_MODE.allowed_tools == ["Read", "Glob", "Grep"]

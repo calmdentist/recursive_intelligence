@@ -215,6 +215,26 @@ class NodeFSM:
         has_accepted = any(
             e.data.get("verdict") == "accept" for e in current_round_verdicts
         )
+        has_rejected = any(
+            e.data.get("verdict") == "reject" for e in current_round_verdicts
+        )
+
+        if all_reviewed and has_rejected:
+            rejected_ids = [
+                e.data.get("child_id", "unknown")
+                for e in current_round_verdicts
+                if e.data.get("verdict") == "reject"
+            ]
+            failure_type = "some_children_rejected" if has_accepted else "all_children_rejected"
+            failure_reason = (
+                "One or more children were rejected: " + ", ".join(rejected_ids)
+                if has_accepted
+                else "No child produced acceptable work"
+            )
+            return self.store.transition_node(self.node_id, NodeState.FAILED, {
+                "failure_type": failure_type,
+                "failure_reason": failure_reason,
+            })
 
         if all_reviewed and has_accepted:
             return self.store.transition_node(self.node_id, NodeState.MERGING, data)
