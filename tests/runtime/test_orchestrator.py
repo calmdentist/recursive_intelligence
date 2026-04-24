@@ -1,5 +1,6 @@
 """Integration tests for the orchestrator – full recursive flow with mock adapter."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -48,7 +49,7 @@ class ScriptedAdapter(AgentAdapter):
 
         raw = {k: v for k, v in resp.items() if not k.startswith("_")}
         return NodeResult(
-            session_id=f"session-{len(self._call_log)}",
+            session_id=resp.get("_session_id", f"session-{len(self._call_log)}"),
             raw=raw,
             result_text="",
             cost=CostRecord(total_usd=0.01),
@@ -120,6 +121,63 @@ class TestSolveDirectly:
         assert adapter.calls[1]["mode"] == "execute"
 
     @pytest.mark.asyncio
+    async def test_done_plan_action_is_retried_as_invalid(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "done", "rationale": "already finished"},
+            {"action": "solve_directly", "rationale": "execute instead"},
+            {"status": "implemented", "summary": "done",
+             "_commit": True, "_commit_file": "output.txt", "_commit_msg": "implement feature"},
+        ])
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("add a feature")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(invalid_events) == 1
+        assert "Planning cannot return done" in invalid_events[0].data["reason"]
+        store.close()
+
+        assert [c["mode"] for c in adapter.calls] == ["plan", "plan", "execute"]
+
+    @pytest.mark.asyncio
+    async def test_planner_repo_mutation_fails_immediately(self, config):
+        adapter = ScriptedAdapter([
+            {"action": "solve_directly", "rationale": "simple task",
+             "_commit": True, "_commit_file": "planned.txt", "_commit_msg": "planned during planning"},
+        ])
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("add a feature")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        mutation_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "planner_mutated_repo"
+        ]
+        failure_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "state_transition" and e.data.get("to") == NodeState.FAILED.value
+        ]
+
+        assert run.status == "failed"
+        assert root.state == NodeState.FAILED
+        assert len(mutation_events) == 1
+        assert "HEAD changed" in mutation_events[0].data["reason"]
+        assert failure_events[-1].data["failure_type"] == "planner_mutated_repo"
+        store.close()
+
+        assert [c["mode"] for c in adapter.calls] == ["plan"]
+
+    @pytest.mark.asyncio
     async def test_resume_run_from_verifying_completes(self, config):
         (config.repo_root / "ok.txt").write_text("ok")
         config.ensure_dirs()
@@ -156,6 +214,185 @@ class TestSolveDirectly:
 
 class TestRecursiveFlow:
     """Root spawns children, children execute, parent reviews and merges."""
+
+    @pytest.mark.asyncio
+    async def test_foundation_wave_wording_about_future_dependency_is_allowed(self, config):
+        adapter = ScriptedAdapter([
+            {
+                "action": "spawn_children",
+                "rationale": "foundation first",
+                "children": [
+                    {"idempotency_key": "foundation",
+                     "objective": "Build the shared packages that all subsequent work depends on.",
+                     "success_criteria": ["foundation exists"],
+                     "domain_name": "foundation",
+                     "file_patterns": ["foundation.py"],
+                     "module_scope": "Shared foundation"},
+                ],
+            },
+            {"action": "solve_directly", "rationale": "small foundation task"},
+            {"status": "implemented", "summary": "built foundation",
+             "_commit": True, "_commit_file": "foundation.py", "_commit_msg": "foundation"},
+            {"verdict": "accept", "reason": "looks good"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build the foundation")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(invalid_events) == 0
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_plan_retry_reuses_same_session_without_duplicate_insert(self, config):
+        adapter = ScriptedAdapter([
+            {
+                "action": "spawn_children",
+                "rationale": "do everything at once",
+                "children": [
+                    {"idempotency_key": "foundation", "objective": "scaffold workspace",
+                     "success_criteria": ["workspace exists"],
+                     "domain_name": "foundation", "file_patterns": ["workspace.py"],
+                     "module_scope": "Workspace bootstrap"},
+                    {"idempotency_key": "feature", "objective": "build dashboard page",
+                     "success_criteria": ["dashboard works"],
+                     "domain_name": "dashboard", "file_patterns": ["dashboard.py"],
+                     "module_scope": "Dashboard page"},
+                ],
+                "_session_id": "root-plan",
+            },
+            {
+                "action": "spawn_children",
+                "rationale": "foundation first",
+                "children": [
+                    {"idempotency_key": "foundation", "objective": "scaffold workspace",
+                     "success_criteria": ["workspace exists"],
+                     "domain_name": "foundation", "file_patterns": ["workspace.py"],
+                     "module_scope": "Workspace bootstrap"},
+                ],
+                "_session_id": "root-plan",
+            },
+            {"action": "solve_directly", "rationale": "simple subtask", "_session_id": "child-plan"},
+            {"status": "implemented", "summary": "workspace built",
+             "_commit": True, "_commit_file": "workspace.py", "_commit_msg": "workspace"},
+            {"verdict": "accept", "reason": "looks good", "_session_id": "root-review"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build workspace and dashboard")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        invalid_events = [
+            e for e in store.get_node_events(root.node_id)
+            if e.event_type == "plan_invalid"
+        ]
+        session_count = store._conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+            ("root-plan",),
+        ).fetchone()[0]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert len(invalid_events) == 1
+        assert session_count == 1
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_manager_revision_routes_to_grandchild(self, config):
+        class ManagerRevisionAdapter(ScriptedAdapter):
+            async def run(self, prompt, worktree, mode, system_prompt=None, resume_session_id=None, on_message=None, is_root=False):
+                if mode == "plan" and "Revision requested by parent:" in prompt:
+                    self._call_log.append({
+                        "prompt": prompt[:100],
+                        "full_prompt": prompt,
+                        "mode": mode,
+                        "worktree": str(worktree),
+                    })
+                    match = re.search(r"node-[0-9a-f]{12}", prompt)
+                    assert match is not None
+                    child_id = match.group(0)
+                    return NodeResult(
+                        session_id="manager-revision-plan",
+                        raw={
+                            "action": "route_to_children",
+                            "rationale": "route revision to existing domain owner",
+                            "routes": [{
+                                "child_node_id": child_id,
+                                "domain_name": "leaf",
+                                "task_spec": "apply the requested manager revision",
+                            }],
+                        },
+                        result_text="",
+                        cost=CostRecord(total_usd=0.01),
+                        stop_reason="end_turn",
+                    )
+                return await super().run(
+                    prompt, worktree, mode, system_prompt, resume_session_id, on_message, is_root
+                )
+
+        adapter = ManagerRevisionAdapter([
+            {"action": "spawn_children", "rationale": "manager child",
+             "children": [
+                 {"idempotency_key": "manager", "objective": "manage web foundation",
+                  "success_criteria": ["revision handled"],
+                  "domain_name": "web", "file_patterns": ["web/**"],
+                  "module_scope": "Web manager"},
+             ]},
+            {"action": "spawn_children", "rationale": "delegate leaf",
+             "children": [
+                 {"idempotency_key": "leaf", "objective": "build leaf file",
+                  "success_criteria": ["leaf exists"],
+                  "domain_name": "leaf", "file_patterns": ["leaf.txt"],
+                  "module_scope": "Leaf implementation"},
+             ]},
+            {"action": "solve_directly", "rationale": "leaf task"},
+            {"status": "implemented", "summary": "built leaf",
+             "_commit": True, "_commit_file": "leaf.txt", "_commit_msg": "leaf v1"},
+            {"verdict": "accept", "reason": "leaf ok"},
+            {"verdict": "revise", "reason": "manager needs revision",
+             "follow_up": "Update the leaf file with the manager revision."},
+            {"status": "implemented", "summary": "revised leaf",
+             "_commit": True, "_commit_file": "revision.txt", "_commit_msg": "leaf revision"},
+            {"verdict": "accept", "reason": "revision ok"},
+            {"verdict": "accept", "reason": "manager ok"},
+        ])
+
+        orch = Orchestrator(config, adapter)
+        run_id = await orch.start_run("build managed web work")
+
+        store = StateStore(config.db_path)
+        run = store.get_run(run_id)
+        root = store.get_node(run.root_node_id)
+        nodes = store.get_run_nodes(run_id)
+        failed_nodes = [node for node in nodes if node.state == NodeState.FAILED]
+        manager = next(node for node in nodes if node.parent_id == root.node_id)
+        manager_transitions = [
+            e for e in store.get_node_events(manager.node_id)
+            if e.event_type == "state_transition"
+        ]
+
+        assert run.status == "completed"
+        assert root.state == NodeState.COMPLETED
+        assert failed_nodes == []
+        assert any(
+            e.data.get("from") == NodeState.COMPLETED.value
+            and e.data.get("to") == NodeState.PLANNING.value
+            for e in manager_transitions
+        )
+        assert (Path(root.worktree_path) / "revision.txt").exists()
+        assert any("Revision requested by parent:" in call["full_prompt"] for call in adapter.calls)
+        store.close()
 
     @pytest.mark.asyncio
     async def test_spawn_review_merge(self, config):
