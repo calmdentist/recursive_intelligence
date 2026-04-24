@@ -5,6 +5,11 @@ Branch: calmdentist/claude-rec-plan
 Status: DRAFT
 Mode: Builder
 
+Note: this is an earlier design draft. The shipped prototype has since tightened a few
+runtime invariants, especially around read-only planning, staged wave decomposition,
+and manager-only behavior after delegation. Use `README.md` and `architecture.md` for
+the current operational model.
+
 ## Problem Statement
 Build a local-first runtime that lets Claude Code solve software tasks recursively by spawning fresh Claude workers in child git worktrees, reviewing their output, looping them when needed, and merging accepted work upward. V1 targets Claude only. The main question is whether this improves repo-scale solve rate and cost-normalized performance versus a flat agent.
 
