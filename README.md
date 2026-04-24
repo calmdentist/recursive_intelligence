@@ -10,6 +10,8 @@ This repo is built to test that thesis directly.
 
 - `rari baseline "<task>"` runs one flat Claude session with no recursion.
 - `rari run "<task>" --persistent` runs the recursive runtime with decomposition, child worktrees, review, and merge.
+- `rari chat [run-id]` opens the interactive TUI for a persistent run, with the root conversation on the left and the node tree on the right.
+- `rari resume <run-id>` resumes a crashed or interrupted persistent run from the last durable state.
 - `rari benchmark swebench ...` compares flat vs recursive on a representative SWE-bench slice using the official SWE-bench evaluation harness.
 
 Each run persists structured artifacts under `.ri/`, including costs, durations, sessions, patches, and benchmark reports.
@@ -23,6 +25,8 @@ The goal is a runtime where:
 - the root node decides when to solve directly vs recurse
 - child work is isolated in separate git worktrees
 - parents review, loop, and integrate child output
+- decomposition happens in staged waves when later work depends on earlier foundation
+- manager nodes stay in management mode after they delegate, routing revisions back to the right child instead of dropping into direct execution
 - the whole process is benchmarkable against a flat control
 
 If this works, recursion and looping should shift the cost-quality frontier for coding agents. A recursive system may be able to augment a cheaper base model or get more leverage out of a stronger one.
@@ -68,12 +72,36 @@ Run the recursive runtime:
 rari run "fix the failing test in this repo" --persistent
 ```
 
+Open the interactive chat UI for a new or existing persistent run:
+
+```bash
+rari chat
+rari chat <run-id>
+```
+
 Inspect a run:
 
 ```bash
 rari tree <run-id>
+rari domains <run-id>
 rari inspect <node-id>
+rari resume <run-id>
 ```
+
+## Runtime Model
+
+- Planning is decision-only. Nodes inspect the repo and choose whether to solve directly, route to an existing child, or spawn a new wave of children.
+- Parallel children should own substantial, mostly disjoint domains. Same-wave children are expected to be runnable against the same parent snapshot.
+- If later work depends on new foundation, the parent should spawn that prerequisite wave first, merge it, and then plan the next wave.
+- Once a node has delegated, it acts as a manager for that slice: it reviews child work, requests revisions, routes follow-up back to the current domain owner, and merges accepted results upward.
+- Worker nodes return a structured handoff so the parent can replan using concrete deliverables, findings, concerns, and suggested next steps.
+
+## Interactive UI
+
+- The left pane is the human-facing conversation with the root node.
+- The right pane shows the live node tree plus details for the selected node.
+- Internal tool chatter and raw control-plane JSON are hidden by default. Use `/debug` only when you want the internal trace.
+- Leaving the chat does not discard a persistent run. `/quit` exits and leaves the run paused; `/done` finalizes it.
 
 ## Benchmarking
 
@@ -101,6 +129,9 @@ rari export-report <benchmark-run-id>
 
 ## Notes
 
+- Persistent runs store their state in `.ri/state.db` and their worktrees under `.ri/worktrees/`.
+- The root conversation is intentionally more human-facing than child control traffic. Internal planning and routing still use structured JSON contracts behind the scenes.
+- The recursive runtime is optimized for benchmarkable prototypes today, not arbitrary production autonomy. The architecture is still evolving around planning quality, review quality, and scheduling.
 - SWE-bench scoring uses the official Docker harness, not a host-local test runner.
 - Benchmark runs can be slow and disk-heavy.
 - On Apple Silicon, the harness uses a local namespace override so images can be built locally when needed.

@@ -10,6 +10,7 @@ The idea is simple:
 2. every parent reviews child work, handles merge conflicts, and can loop a child over multiple turns
 3. any node can decide whether it should solve the task itself or spawn children
 4. an external orchestrator facilitates communication between parents and children
+5. if a node delegates, it becomes the manager for that slice instead of dropping back into direct implementation
 
 That is the whole model.
 
@@ -37,6 +38,7 @@ If it spawns children, it becomes responsible for:
 - handling merge conflicts between children
 - sending follow-up instructions to children when needed
 - synthesizing child progress into a result for its own parent
+- planning follow-up waves only after prerequisite child work is merged into its own snapshot
 
 ---
 
@@ -90,6 +92,8 @@ It receives the top-level task and either:
 
 The root is also just a node.
 It follows the same logic as every other node.
+The difference is that its outward-facing conversation should stay human-readable even
+though the control plane underneath is structured.
 
 ---
 
@@ -115,6 +119,9 @@ The important rule is:
 
 > a child inherits the parent’s state, but the parent decides whether the child’s changes are accepted.
 
+This also means siblings are independent against the same parent snapshot. One child
+should not assume another sibling's unmerged output exists.
+
 ---
 
 ## Parent-child relationship
@@ -132,6 +139,10 @@ That means the parent is responsible for:
 
 Children do work.
 Parents synthesize.
+
+Once a parent has delegated a slice, it should stay in manager mode for that slice.
+If more work is needed in the same domain, the parent routes that follow-up back to
+the current child owner instead of implementing it directly or spawning a duplicate child.
 
 ---
 
@@ -159,6 +170,30 @@ So the basic loop is:
    - or messages the child again with further direction
 
 This lets work continue across multiple turns without creating a new child every time.
+
+If the child itself delegated, that node loops by replanning and routing work to its
+own children rather than falling back into direct execution.
+
+---
+
+## Planning rules
+
+Planning is read-only.
+
+During planning, a node inspects the repo and decides whether to:
+
+- solve directly
+- route follow-up to an existing child
+- spawn a new wave of children
+
+Planning should not edit files, install packages, or create commits.
+
+The key invariant is not just disjoint file scopes. It is snapshot independence:
+
+- children in the same live wave should be runnable against the same parent snapshot
+- if later work depends on new shared foundation, the parent should spawn only that
+  prerequisite wave first
+- after those children merge, the parent plans the next wave from the updated snapshot
 
 ---
 
@@ -212,6 +247,9 @@ Instead:
 - the parent sees the child’s latest output and decides what to do next
 
 So upward communication is event-driven.
+
+In practice, follow-up should usually be routed back to the existing domain owner.
+Creating a second child for dependent work in the same domain is usually a decomposition failure.
 
 ---
 
